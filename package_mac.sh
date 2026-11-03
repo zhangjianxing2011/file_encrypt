@@ -38,6 +38,9 @@ mkdir -p "${RESOURCES}"
 cp "${TARGET_BIN}" "${MACOS}/securevault"
 chmod +x "${MACOS}/securevault"
 
+# 移除隔离属性，防止 macOS Gatekeeper 报 "已损坏，无法打开"
+xattr -cr "${MACOS}/securevault" 2>/dev/null || true
+
 # 生成 macOS 原生高清 ICNS 图标
 if [ -f "assets/icon.png" ]; then
     echo "🎨 正在生成 macOS 高清图标..."
@@ -91,10 +94,18 @@ cat > "${CONTENTS}/Info.plist" <<EOF
 </plist>
 EOF
 
+# 移除整个 .app 包的隔离属性
+xattr -cr "${BUNDLE}" 2>/dev/null || true
+
 # 打包成免安装 ZIP 包
 ZIP_NAME="${APP_NAME}-macOS-portable.zip"
 rm -f "${ZIP_NAME}"
-zip -q -r "${ZIP_NAME}" "${BUNDLE}"
+# 使用 ditto 打包以正确保留 macOS 扩展属性和权限
+if command -v ditto >/dev/null 2>&1; then
+    ditto -c -k --keepParent "${BUNDLE}" "${ZIP_NAME}"
+else
+    zip -q -r "${ZIP_NAME}" "${BUNDLE}"
+fi
 
 # 打包成 DMG 安装镜像（若环境支持 hdiutil）
 DMG_NAME="${APP_NAME}.dmg"
@@ -119,7 +130,7 @@ echo "   - 绿色压缩包: ${ZIP_NAME} (解压即用)"
 echo ""
 echo "💡 macOS 用户使用说明："
 echo "   1. 打开 ${DMG_NAME}，将 ${APP_NAME}.app 拖入 Applications 即可完成安装。"
-echo "   2. 若首次打开出现『无法打开，因为来自未识别的开发者』提示："
-echo "      - 方法 A（推荐）：按住 Control 键或右键点击 SecureVault.app -> 选择【打开】-> 点击【仍要打开】"
-echo "      - 方法 B（命令行）：xattr -cr ${BUNDLE}"
+echo "   2. 若首次打开出现『已损坏，无法打开』或『来自未识别的开发者』提示："
+echo "      - 方法 A（命令行，推荐）：sudo xattr -rd com.apple.quarantine /Applications/${BUNDLE}"
+echo "      - 方法 B（右键）：按住 Control 键或右键点击 SecureVault.app -> 选择【打开】-> 点击【仍要打开】"
 echo "================================================================="

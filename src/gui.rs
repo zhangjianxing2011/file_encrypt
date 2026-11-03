@@ -14,10 +14,83 @@ enum ActiveTab {
 }
 
 enum VaultTaskMsg {
+    #[allow(dead_code)]
     Progress(String),
     Success(String),
     Error(String),
     ExitEncryptComplete(Result<(), String>),
+    DecryptProgress(DecryptProgressInfo),
+    EncryptProgress(EncryptProgressInfo),
+    BatchProgress(BatchProgressInfo),
+    BatchFolderCompleted {
+        folder: PathBuf,
+        is_encrypt: bool,
+        result: Result<(), String>,
+    },
+    BatchAllCompleted {
+        total: usize,
+        success_count: usize,
+        fail_count: usize,
+        is_encrypt: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct DecryptProgressInfo {
+    pub folder: PathBuf,
+    pub completed: usize,
+    pub total: usize,
+    pub current_file: String,
+    pub file_size: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct EncryptProgressInfo {
+    pub folder: PathBuf,
+    pub completed: usize,
+    pub total: usize,
+    pub current_file: String,
+    pub file_size: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchProgressInfo {
+    pub current_folder_index: usize,
+    pub total_folders: usize,
+    pub folder_name: String,
+    pub folder_path: PathBuf,
+    pub is_encrypt: bool,
+    pub folder_completed: usize,
+    pub folder_total: usize,
+    pub current_file: String,
+    pub file_size: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveProgressState {
+    pub folder: PathBuf,
+    pub is_decrypt: bool,
+    pub completed: usize,
+    pub total: usize,
+    pub current_file: String,
+    pub recent_files: Vec<(String, u64)>, // list of (relative_path, size)
+    pub total_bytes_done: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatchMode {
+    Encrypt,
+    Decrypt,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchDialogState {
+    pub mode: BatchMode,
+    pub selected_paths: HashSet<PathBuf>,
+    pub password: String,
+    pub confirm_password: String,
+    pub show_password: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -73,6 +146,13 @@ pub struct SecureVaultApp {
     progress_text: String,
     tx: Sender<VaultTaskMsg>,
     rx: Receiver<VaultTaskMsg>,
+
+    // Real-time progress feedback
+    active_progress: Option<ActiveProgressState>,
+
+    // Batch operations
+    batch_dialog: Option<BatchDialogState>,
+    batch_running_info: Option<BatchProgressInfo>,
 
     // Session tracking of unlocked folders (Requirement 3)
     unlocked_during_session: HashSet<PathBuf>,
@@ -1091,6 +1171,9 @@ impl SecureVaultApp {
             progress_text: String::new(),
             tx,
             rx,
+            active_progress: None,
+            batch_dialog: None,
+            batch_running_info: None,
             unlocked_during_session: HashSet::new(),
             show_exit_dialog: false,
             bypass_exit_check: false,
@@ -1192,6 +1275,11 @@ impl SecureVaultApp {
 
 impl eframe::App for SecureVaultApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // High responsiveness during active background encryption/decryption
+        if self.is_busy {
+            ui.ctx().request_repaint();
+        }
+
         // ── Check close request (Requirement 3: Exit Re-encrypt Prompt) ──
         if ui.input(|i| i.viewport().close_requested()) && !self.bypass_exit_check {
             let unlocked = self.get_unlocked_vaults();
@@ -1210,8 +1298,111 @@ impl eframe::App for SecureVaultApp {
                 VaultTaskMsg::Progress(txt) => {
                     self.progress_text = txt;
                 }
+                VaultTaskMsg::DecryptProgress(info) => {
+                    let state = self.active_progress.get_or_insert_with(|| ActiveProgressState {
+                        folder: info.folder.clone(),
+                        is_decrypt: true,
+                        completed: 0,
+                        total: info.total,
+                        current_file: String::new(),
+                        recent_files: Vec::new(),
+                        total_bytes_done: 0,
+                    });
+                    state.completed = info.completed;
+                    state.total = info.total;
+                    state.current_file = info.current_file.clone();
+                    state.total_bytes_done += info.file_size;
+                    state.recent_files.push((info.current_file, info.file_size));
+                    if state.recent_files.len() > 60 {
+                        state.recent_files.remove(0);
+                    }
+                    let pct = if info.total > 0 {
+                        (info.completed as f64 / info.total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    self.progress_text = format!("正在解密还原: {} / {} 个文件 ({:.1}%)", info.completed, info.total, pct);
+                }
+                VaultTaskMsg::EncryptProgress(info) => {
+                    let state = self.active_progress.get_or_insert_with(|| ActiveProgressState {
+                        folder: info.folder.clone(),
+                        is_decrypt: false,
+                        completed: 0,
+                        total: info.total,
+                        current_file: String::new(),
+                        recent_files: Vec::new(),
+                        total_bytes_done: 0,
+                    });
+                    state.completed = info.completed;
+                    state.total = info.total;
+                    state.current_file = info.current_file.clone();
+                    state.total_bytes_done += info.file_size;
+                    state.recent_files.push((info.current_file, info.file_size));
+                    if state.recent_files.len() > 60 {
+                        state.recent_files.remove(0);
+                    }
+                    let pct = if info.total > 0 {
+                        (info.completed as f64 / info.total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    self.progress_text = format!("正在加密锁定: {} / {} 个文件 ({:.1}%)", info.completed, info.total, pct);
+                }
+                VaultTaskMsg::BatchProgress(binfo) => {
+                    self.batch_running_info = Some(binfo.clone());
+                    let action = if binfo.is_encrypt { "加密" } else { "解密" };
+                    let pct = if binfo.folder_total > 0 {
+                        format!(" ({:.1}%)", (binfo.folder_completed as f64 / binfo.folder_total as f64) * 100.0)
+                    } else {
+                        String::new()
+                    };
+                    self.progress_text = format!(
+                        "批量{}中 [{}/{}]: {} - 正在处理文件 {}/{}{}",
+                        action,
+                        binfo.current_folder_index + 1,
+                        binfo.total_folders,
+                        binfo.folder_name,
+                        binfo.folder_completed,
+                        binfo.folder_total,
+                        pct
+                    );
+                }
+                VaultTaskMsg::BatchFolderCompleted { folder, is_encrypt, result } => {
+                    if folder.exists() {
+                        self.inspection_cache.insert(folder.clone(), inspect_vault(&folder));
+                    }
+                    if is_encrypt {
+                        self.unlocked_during_session.remove(&folder);
+                    } else {
+                        self.unlocked_during_session.insert(folder.clone());
+                    }
+                    if let Err(e) = result {
+                        eprintln!("Batch error for {}: {}", folder.display(), e);
+                    }
+                }
+                VaultTaskMsg::BatchAllCompleted { total, success_count, fail_count, is_encrypt } => {
+                    self.is_busy = false;
+                    self.active_progress = None;
+                    self.batch_running_info = None;
+                    self.progress_text.clear();
+                    self.refresh_all_inspections();
+                    let action = if is_encrypt { "加密" } else { "解密" };
+                    if fail_count == 0 {
+                        self.status_message = Some((
+                            format!("✅ 批量{}全部完成！共成功处理 {} / {} 个项目。", action, success_count, total),
+                            false,
+                        ));
+                    } else {
+                        self.status_message = Some((
+                            format!("⚠️ 批量{}完成：成功 {} / {} 个，失败 {} 个（详情请查看日志）。", action, success_count, total, fail_count),
+                            true,
+                        ));
+                    }
+                }
                 VaultTaskMsg::Success(txt) => {
                     self.is_busy = false;
+                    self.active_progress = None;
+                    self.batch_running_info = None;
                     self.progress_text.clear();
                     self.status_message = Some((txt, false));
                     self.password.clear();
@@ -1227,6 +1418,8 @@ impl eframe::App for SecureVaultApp {
                 }
                 VaultTaskMsg::Error(err) => {
                     self.is_busy = false;
+                    self.active_progress = None;
+                    self.batch_running_info = None;
                     self.progress_text.clear();
                     self.status_message = Some((format!("失败: {}", err), true));
                     self.password.clear();
@@ -1340,6 +1533,13 @@ impl eframe::App for SecureVaultApp {
             ui.painter().rect_filled(screen_rect, 0.0, egui::Color32::from_rgba_premultiplied(0, 0, 0, 150));
             self.ui_confirm_remove_dialog(ui);
         }
+
+        // ── Batch Operation Modal Dialog ──
+        if self.batch_dialog.is_some() {
+            let screen_rect = ui.max_rect();
+            ui.painter().rect_filled(screen_rect, 0.0, egui::Color32::from_rgba_premultiplied(0, 0, 0, 150));
+            self.ui_batch_dialog(ui);
+        }
     }
 }
 
@@ -1375,24 +1575,34 @@ impl SecureVaultApp {
                         egui::vec2(58.0, 24.0),
                         5.0,
                     )
-                    .on_hover_text("添加新的本地文件夹进行加密管理")
+                    .on_hover_text("添加新的本地文件夹进行加密管理（支持单选或多选）")
                     .clicked()
                     {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            let name = folder
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "Folder".into());
+                        if let Some(folders) = rfd::FileDialog::new().pick_folders() {
+                            let mut added_any = false;
+                            let mut last_selected = None;
+                            for folder in folders {
+                                let name = folder
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "Folder".into());
 
-                            if !self.tracked_vaults.iter().any(|v| v.path == folder) {
-                                self.expanded_folders.insert(folder.clone());
-                                self.tracked_vaults.push(TrackedVault {
-                                    name: name.clone(),
-                                    path: folder.clone(),
-                                });
+                                if !self.tracked_vaults.iter().any(|v| v.path == folder) {
+                                    self.expanded_folders.insert(folder.clone());
+                                    self.tracked_vaults.push(TrackedVault {
+                                        name: name.clone(),
+                                        path: folder.clone(),
+                                    });
+                                    let new_idx = self.tracked_vaults.len() - 1;
+                                    last_selected = Some((folder, name, true, Some(new_idx)));
+                                    added_any = true;
+                                }
+                            }
+                            if added_any {
                                 save_tracked_vaults(&self.tracked_vaults);
-                                let new_idx = self.tracked_vaults.len() - 1;
-                                self.select_target(folder, name, true, Some(new_idx));
+                                if let Some((f_path, f_name, f_is_dir, f_idx)) = last_selected {
+                                    self.select_target(f_path, f_name, f_is_dir, f_idx);
+                                }
                             }
                         }
                     }
@@ -1441,6 +1651,63 @@ impl SecureVaultApp {
                 });
             },
         );
+
+        // ── Batch Operation Buttons (批量加密 / 批量解密) ──
+        if !self.tracked_vaults.is_empty() {
+            let unlocked_count = self.tracked_vaults.iter().filter(|v| v.path.exists() && !vault::is_locked(&v.path)).count();
+            let locked_count = self.tracked_vaults.iter().filter(|v| v.path.exists() && vault::is_locked(&v.path)).count();
+
+            ui.add_space(4.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 26.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    if icon_text_button(
+                        ui,
+                        unlocked_count > 0 && !self.is_busy,
+                        "🔒",
+                        &format!("批量加密 ({})", unlocked_count),
+                        egui::Color32::from_rgb(16, 149, 90),
+                        egui::Stroke::NONE,
+                        egui::Color32::WHITE,
+                        egui::vec2(0.0, 24.0),
+                        4.0,
+                    )
+                    .on_hover_text(if unlocked_count > 0 {
+                        "一键批量加密所有或选中的未锁定项目"
+                    } else {
+                        "当前没有未锁定的项目"
+                    })
+                    .clicked()
+                    {
+                        self.open_batch_dialog(BatchMode::Encrypt);
+                    }
+
+                    ui.add_space(4.0);
+
+                    if icon_text_button(
+                        ui,
+                        locked_count > 0 && !self.is_busy,
+                        "🔓",
+                        &format!("批量解密 ({})", locked_count),
+                        egui::Color32::from_rgb(217, 119, 6),
+                        egui::Stroke::NONE,
+                        egui::Color32::WHITE,
+                        egui::vec2(0.0, 24.0),
+                        4.0,
+                    )
+                    .on_hover_text(if locked_count > 0 {
+                        "一键批量解密所有或选中的已加密项目"
+                    } else {
+                        "当前没有已加密的项目"
+                    })
+                    .clicked()
+                    {
+                        self.open_batch_dialog(BatchMode::Decrypt);
+                    }
+                },
+            );
+        }
 
         ui.add_space(4.0);
         ui.separator();
@@ -1532,19 +1799,48 @@ impl SecureVaultApp {
 
                                     ui.add_space(3.0);
 
-                                    // 2. Status badge (matching 22px height pill, vertically centered)
-                                    let (status_icon, status_text, status_border, status_text_color, status_bg) = if !exists {
-                                        ("❌", "不存在", egui::Color32::from_rgb(239, 68, 68), egui::Color32::from_rgb(255, 210, 215), egui::Color32::from_rgb(46, 18, 22))
+                                    // 2. Status badge (matching 22px height pill, vertically centered, with live progress)
+                                    let is_active_decrypting = self.active_progress.as_ref().map_or(false, |p| p.is_decrypt && p.folder == vault_item.path);
+                                    let is_active_encrypting = self.active_progress.as_ref().map_or(false, |p| !p.is_decrypt && p.folder == vault_item.path);
+                                    let is_batch_current = self.batch_running_info.as_ref().map_or(false, |b| b.folder_path == vault_item.path);
+
+                                    let (status_icon, status_text_owned, status_border, status_text_color, status_bg) = if is_active_decrypting {
+                                        let p = self.active_progress.as_ref().unwrap();
+                                        let text = if p.total > 0 {
+                                            format!("解密中 {}/{}", p.completed, p.total)
+                                        } else {
+                                            "解密中...".to_string()
+                                        };
+                                        ("🔄", text, egui::Color32::from_rgb(217, 119, 6), egui::Color32::WHITE, egui::Color32::from_rgb(50, 30, 10))
+                                    } else if is_active_encrypting {
+                                        let p = self.active_progress.as_ref().unwrap();
+                                        let text = if p.total > 0 {
+                                            format!("加密中 {}/{}", p.completed, p.total)
+                                        } else {
+                                            "加密中...".to_string()
+                                        };
+                                        ("🔄", text, egui::Color32::from_rgb(16, 185, 129), egui::Color32::WHITE, egui::Color32::from_rgb(12, 50, 30))
+                                    } else if is_batch_current {
+                                        let b = self.batch_running_info.as_ref().unwrap();
+                                        let action = if b.is_encrypt { "加密中" } else { "解密中" };
+                                        let text = if b.folder_total > 0 {
+                                            format!("{} {}/{}", action, b.folder_completed, b.folder_total)
+                                        } else {
+                                            format!("{}...", action)
+                                        };
+                                        ("🔄", text, egui::Color32::from_rgb(59, 130, 246), egui::Color32::WHITE, egui::Color32::from_rgb(20, 45, 80))
+                                    } else if !exists {
+                                        ("❌", "不存在".to_string(), egui::Color32::from_rgb(239, 68, 68), egui::Color32::from_rgb(255, 210, 215), egui::Color32::from_rgb(46, 18, 22))
                                     } else if locked {
-                                        ("🔒", "已加密", egui::Color32::from_rgb(16, 185, 129), egui::Color32::from_rgb(230, 255, 245), egui::Color32::from_rgb(12, 42, 28))
+                                        ("🔒", "已加密".to_string(), egui::Color32::from_rgb(16, 185, 129), egui::Color32::from_rgb(230, 255, 245), egui::Color32::from_rgb(12, 42, 28))
                                     } else {
-                                        ("🔓", "未锁定", egui::Color32::from_rgb(245, 158, 11), egui::Color32::from_rgb(255, 246, 214), egui::Color32::from_rgb(48, 34, 10))
+                                        ("🔓", "未锁定".to_string(), egui::Color32::from_rgb(245, 158, 11), egui::Color32::from_rgb(255, 246, 214), egui::Color32::from_rgb(48, 34, 10))
                                     };
 
                                     let badge_resp = render_badge_pill(
                                         ui,
                                         status_icon,
-                                        status_text,
+                                        &status_text_owned,
                                         status_bg,
                                         egui::Stroke::new(1.0, status_border),
                                         status_text_color,
@@ -2811,8 +3107,14 @@ impl SecureVaultApp {
 
         ui.add_space(10.0);
 
-        // Progress spinner & status messages
-        if self.is_busy {
+        // Real-time progress cards & status messages
+        if let Some(active) = &self.active_progress {
+            self.ui_active_progress_card(ui, active);
+            ui.add_space(8.0);
+        } else if let Some(binfo) = &self.batch_running_info {
+            self.ui_batch_progress_card(ui, binfo);
+            ui.add_space(8.0);
+        } else if self.is_busy {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(
@@ -2821,6 +3123,7 @@ impl SecureVaultApp {
                         .color(egui::Color32::from_rgb(147, 197, 253)),
                 );
             });
+            ui.add_space(8.0);
         }
 
         if self.status_message.is_some() {
@@ -3110,9 +3413,587 @@ impl SecureVaultApp {
         });
     }
 
+    fn open_batch_dialog(&mut self, mode: BatchMode) {
+        let mut selected = HashSet::new();
+        for v in &self.tracked_vaults {
+            if v.path.exists() {
+                let is_locked = vault::is_locked(&v.path);
+                if mode == BatchMode::Encrypt && !is_locked {
+                    selected.insert(v.path.clone());
+                } else if mode == BatchMode::Decrypt && is_locked {
+                    selected.insert(v.path.clone());
+                }
+            }
+        }
+        self.batch_dialog = Some(BatchDialogState {
+            mode,
+            selected_paths: selected,
+            password: String::new(),
+            confirm_password: String::new(),
+            show_password: false,
+            error: None,
+        });
+    }
+
+    fn ui_batch_dialog(&mut self, ui: &mut egui::Ui) {
+        let mut batch = match &self.batch_dialog {
+            Some(b) => b.clone(),
+            None => return,
+        };
+
+        let is_encrypt = batch.mode == BatchMode::Encrypt;
+        let (title, action_name, action_color) = if is_encrypt {
+            ("🔒 批量加密项目", "立即开始批量加密", egui::Color32::from_rgb(16, 149, 90))
+        } else {
+            ("🔓 批量解密项目", "立即开始批量解密", egui::Color32::from_rgb(217, 119, 6))
+        };
+
+        let candidate_vaults: Vec<TrackedVault> = self.tracked_vaults
+            .iter()
+            .filter(|v| {
+                if !v.path.exists() {
+                    return false;
+                }
+                let locked = vault::is_locked(&v.path);
+                if is_encrypt { !locked } else { locked }
+            })
+            .cloned()
+            .collect();
+
+        let mut close_dialog = false;
+        let mut start_task_args: Option<(BatchMode, Vec<TrackedVault>, String)> = None;
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(22, 28, 40))
+                    .stroke(egui::Stroke::new(1.2, egui::Color32::from_rgb(60, 75, 105)))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(20, 16)),
+            )
+            .show(ui.ctx(), |ui| {
+                ui.set_width(480.0);
+                ui.add_space(2.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 24.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let desc = if is_encrypt {
+                            "请勾选需要进行批量加密的项目（默认已全选）："
+                        } else {
+                            "请勾选需要进行批量解密的项目（默认已全选）："
+                        };
+                        ui.label(
+                            egui::RichText::new(desc)
+                                .size(13.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(220, 235, 255)),
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if icon_text_button(
+                                ui,
+                                true,
+                                "☐",
+                                "全不选",
+                                egui::Color32::from_rgb(30, 38, 54),
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 65, 90)),
+                                egui::Color32::from_rgb(180, 195, 220),
+                                egui::vec2(65.0, 22.0),
+                                4.0,
+                            )
+                            .clicked()
+                            {
+                                batch.selected_paths.clear();
+                            }
+
+                            ui.add_space(4.0);
+
+                            if icon_text_button(
+                                ui,
+                                true,
+                                "☑",
+                                "全选",
+                                egui::Color32::from_rgb(30, 38, 54),
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 65, 90)),
+                                egui::Color32::from_rgb(180, 195, 220),
+                                egui::vec2(55.0, 22.0),
+                                4.0,
+                            )
+                            .clicked()
+                            {
+                                for v in &candidate_vaults {
+                                    batch.selected_paths.insert(v.path.clone());
+                                }
+                            }
+                        });
+                    },
+                );
+
+                ui.add_space(8.0);
+
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(16, 21, 31))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 48, 68)))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        if candidate_vaults.is_empty() {
+                            ui.label(egui::RichText::new("没有找到符合条件的项目").weak().size(11.5));
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .max_height(140.0)
+                                .show(ui, |ui| {
+                                    for v in &candidate_vaults {
+                                        let mut checked = batch.selected_paths.contains(&v.path);
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width(), 22.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                if ui.checkbox(&mut checked, "").changed() {
+                                                    if checked {
+                                                        batch.selected_paths.insert(v.path.clone());
+                                                    } else {
+                                                        batch.selected_paths.remove(&v.path);
+                                                    }
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(&v.name)
+                                                        .size(12.0)
+                                                        .strong()
+                                                        .color(if checked { egui::Color32::WHITE } else { egui::Color32::from_rgb(140, 155, 180) }),
+                                                );
+                                                ui.add_space(6.0);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(v.path.to_string_lossy())
+                                                            .size(10.5)
+                                                            .monospace()
+                                                            .color(egui::Color32::from_rgb(115, 130, 155)),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
+                                        );
+                                    }
+                                });
+                        }
+                    });
+
+                ui.add_space(10.0);
+
+                let pwd_label = if is_encrypt {
+                    "设置加密密钥（将统一应用于所选项目）："
+                } else {
+                    "输入解密密钥（将统一应用于所选项目）："
+                };
+                ui.label(egui::RichText::new(pwd_label).size(12.5).strong().color(egui::Color32::from_rgb(220, 235, 255)));
+                ui.add_space(6.0);
+
+                egui::Grid::new("batch_pw_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                    ui.label(egui::RichText::new(if is_encrypt { "设置新密钥:" } else { "输入密钥:" }).size(12.5));
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 32.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(bordered_text_edit(&mut batch.password, !batch.show_password, 220.0));
+                            if is_encrypt {
+                                ui.add_space(4.0);
+                                if icon_text_button(
+                                    ui,
+                                    true,
+                                    "🎲",
+                                    "随机 64 位",
+                                    egui::Color32::from_rgb(32, 42, 60),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 75, 108)),
+                                    egui::Color32::from_rgb(215, 230, 255),
+                                    egui::vec2(100.0, 32.0),
+                                    5.0,
+                                )
+                                .on_hover_text("一键生成 64 位高熵随机密钥并复制到剪贴板")
+                                .clicked()
+                                {
+                                    let gen = generate_random_64_char_password();
+                                    ui.ctx().copy_text(gen.clone());
+                                    batch.password = gen.clone();
+                                    batch.confirm_password = gen;
+                                    batch.show_password = true;
+                                }
+                            }
+                        },
+                    );
+                    ui.end_row();
+
+                    if is_encrypt {
+                        ui.label(egui::RichText::new("确认新密钥:").size(12.5));
+                        ui.add(bordered_text_edit(&mut batch.confirm_password, !batch.show_password, 220.0));
+                        ui.end_row();
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.checkbox(&mut batch.show_password, "显示明文密码");
+
+                if let Some(err) = &batch.error {
+                    ui.add_space(6.0);
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(46, 18, 22))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(239, 68, 68)))
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.colored_label(egui::Color32::from_rgb(255, 180, 180), format!("❌  {}", err));
+                        });
+                }
+
+                ui.add_space(14.0);
+
+                let selected_count = batch.selected_paths.len();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 32.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if icon_text_button(
+                            ui,
+                            selected_count > 0,
+                            if is_encrypt { "🔒" } else { "🔓" },
+                            &format!("{} ({})", action_name, selected_count),
+                            action_color,
+                            egui::Stroke::NONE,
+                            egui::Color32::WHITE,
+                            egui::vec2(165.0, 32.0),
+                            6.0,
+                        )
+                        .clicked()
+                        {
+                            if batch.selected_paths.is_empty() {
+                                batch.error = Some("请至少选择一个项目".into());
+                            } else if batch.password.is_empty() {
+                                batch.error = Some("密钥不能为空".into());
+                            } else if is_encrypt && batch.password != batch.confirm_password {
+                                batch.error = Some("两次输入的密钥不一致".into());
+                            } else {
+                                let selected_vaults: Vec<TrackedVault> = candidate_vaults
+                                    .iter()
+                                    .filter(|v| batch.selected_paths.contains(&v.path))
+                                    .cloned()
+                                    .collect();
+                                start_task_args = Some((batch.mode, selected_vaults, batch.password.clone()));
+                                close_dialog = true;
+                            }
+                        }
+
+                        ui.add_space(8.0);
+
+                        if icon_text_button(
+                            ui,
+                            true,
+                            "❌",
+                            "取消",
+                            egui::Color32::from_rgb(34, 43, 60),
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 70, 95)),
+                            egui::Color32::from_rgb(200, 215, 240),
+                            egui::vec2(76.0, 32.0),
+                            6.0,
+                        )
+                        .clicked()
+                        {
+                            close_dialog = true;
+                        }
+                    },
+                );
+
+                ui.add_space(2.0);
+            });
+
+        if close_dialog {
+            self.batch_dialog = None;
+        } else {
+            self.batch_dialog = Some(batch);
+        }
+
+        if let Some((mode, vaults, pwd)) = start_task_args {
+            self.start_batch_task(mode, vaults, pwd);
+        }
+    }
+
+    fn ui_active_progress_card(&self, ui: &mut egui::Ui, active: &ActiveProgressState) {
+        let (icon, title, color, bar_color) = if active.is_decrypt {
+            ("🔓", "正在实时解密还原...", egui::Color32::from_rgb(217, 119, 6), egui::Color32::from_rgb(245, 158, 11))
+        } else {
+            ("🔒", "正在实时加密锁定...", egui::Color32::from_rgb(16, 185, 129), egui::Color32::from_rgb(16, 185, 129))
+        };
+
+        egui::Frame::default()
+            .fill(egui::Color32::from_rgb(20, 26, 38))
+            .stroke(egui::Stroke::new(1.2, color))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 26.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spinner();
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!("{}  {}", icon, title))
+                                .size(14.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let pct = if active.total > 0 {
+                                (active.completed as f32 / active.total as f32) * 100.0
+                            } else {
+                                0.0
+                            };
+                            ui.label(
+                                egui::RichText::new(format!("{:.1}%", pct))
+                                    .size(14.0)
+                                    .strong()
+                                    .color(color),
+                            );
+                        });
+                    },
+                );
+
+                ui.add_space(8.0);
+
+                let progress_frac = if active.total > 0 {
+                    (active.completed as f32 / active.total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let pbar = egui::ProgressBar::new(progress_frac)
+                    .show_percentage()
+                    .fill(bar_color)
+                    .animate(true);
+                ui.add(pbar);
+
+                ui.add_space(8.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let action_noun = if active.is_decrypt { "已解密" } else { "已加密" };
+                        ui.label(
+                            egui::RichText::new(format!("{}: {} / {} 个文件", action_noun, active.completed, active.total))
+                                .size(12.5)
+                                .strong()
+                                .color(egui::Color32::from_rgb(225, 235, 255)),
+                        );
+                        if active.total_bytes_done > 0 {
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(format!("累计处理: {}", format_bytes(active.total_bytes_done)))
+                                    .size(11.5)
+                                    .color(egui::Color32::from_rgb(147, 197, 253)),
+                            );
+                        }
+                    },
+                );
+
+                if !active.current_file.is_empty() {
+                    ui.add_space(4.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(egui::RichText::new("当前文件:").size(11.0).weak());
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&active.current_file)
+                                        .size(11.0)
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(180, 210, 245)),
+                                )
+                                .truncate(),
+                            );
+                        },
+                    );
+                }
+
+                if !active.recent_files.is_empty() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    let list_title = if active.is_decrypt {
+                        format!("⚡ 实时解密文件清单 (已还原 {} 个文件):", active.recent_files.len())
+                    } else {
+                        format!("⚡ 实时加密文件清单 (已加密 {} 个文件):", active.recent_files.len())
+                    };
+                    ui.label(
+                        egui::RichText::new(list_title)
+                            .size(11.5)
+                            .strong()
+                            .color(if active.is_decrypt { egui::Color32::from_rgb(245, 158, 11) } else { egui::Color32::from_rgb(52, 211, 153) }),
+                    );
+                    ui.add_space(4.0);
+
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(14, 18, 26))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(32, 42, 60)))
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(130.0)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for (fname, fsize) in active.recent_files.iter().rev() {
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width(), 18.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                let check_color = if active.is_decrypt {
+                                                    egui::Color32::from_rgb(245, 158, 11)
+                                                } else {
+                                                    egui::Color32::from_rgb(52, 211, 153)
+                                                };
+                                                ui.colored_label(check_color, "✓");
+                                                ui.add_space(4.0);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(fname)
+                                                            .size(10.5)
+                                                            .monospace()
+                                                            .color(egui::Color32::from_rgb(205, 220, 240)),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(format_bytes(*fsize))
+                                                            .size(10.0)
+                                                            .weak(),
+                                                    );
+                                                });
+                                            },
+                                        );
+                                    }
+                                });
+                        });
+                }
+            });
+    }
+
+    fn ui_batch_progress_card(&self, ui: &mut egui::Ui, binfo: &BatchProgressInfo) {
+        let action = if binfo.is_encrypt { "批量加密锁定" } else { "批量解密还原" };
+        let action_color = if binfo.is_encrypt {
+            egui::Color32::from_rgb(16, 185, 129)
+        } else {
+            egui::Color32::from_rgb(217, 119, 6)
+        };
+
+        egui::Frame::default()
+            .fill(egui::Color32::from_rgb(20, 26, 38))
+            .stroke(egui::Stroke::new(1.2, action_color))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 26.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spinner();
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!("🔄  正在执行{}...", action))
+                                .size(14.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("第 {} / {} 个项目", binfo.current_folder_index + 1, binfo.total_folders))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(action_color),
+                            );
+                        });
+                    },
+                );
+
+                ui.add_space(8.0);
+
+                let overall_frac = if binfo.total_folders > 0 {
+                    (binfo.current_folder_index as f32 / binfo.total_folders as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let pbar = egui::ProgressBar::new(overall_frac)
+                    .show_percentage()
+                    .fill(action_color)
+                    .animate(true);
+                ui.add(pbar);
+
+                ui.add_space(8.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(egui::RichText::new("正在处理项目:").size(12.0).weak());
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(&binfo.folder_name)
+                                .size(13.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        if binfo.folder_total > 0 {
+                            ui.add_space(8.0);
+                            let pct = (binfo.folder_completed as f32 / binfo.folder_total as f32) * 100.0;
+                            ui.label(
+                                egui::RichText::new(format!("(文件进度: {} / {} · {:.1}%)", binfo.folder_completed, binfo.folder_total, pct))
+                                    .size(11.5)
+                                    .color(egui::Color32::from_rgb(147, 197, 253)),
+                            );
+                        }
+                    },
+                );
+
+                if !binfo.current_file.is_empty() {
+                    ui.add_space(4.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(egui::RichText::new("当前文件:").size(11.0).weak());
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&binfo.current_file)
+                                        .size(11.0)
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(180, 210, 245)),
+                                )
+                                .truncate(),
+                            );
+                            if binfo.file_size > 0 {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format_bytes(binfo.file_size))
+                                            .size(10.5)
+                                            .weak(),
+                                    );
+                                });
+                            }
+                        },
+                    );
+                }
+            });
+    }
+
     fn start_lock_task(&mut self, path: &Path) {
         let path = path.to_path_buf();
-        // Immediately clear input fields upon clicking lock
         let password = std::mem::take(&mut self.password);
         self.confirm_password.clear();
         let tx = self.tx.clone();
@@ -3124,26 +4005,52 @@ impl SecureVaultApp {
         // Remove from session unlocked set
         self.unlocked_during_session.remove(&path);
 
+        let target_path = path.clone();
+        self.active_progress = Some(ActiveProgressState {
+            folder: path.clone(),
+            is_decrypt: false,
+            completed: 0,
+            total: 0,
+            current_file: String::new(),
+            recent_files: Vec::new(),
+            total_bytes_done: 0,
+        });
+
         thread::spawn(move || {
             use zeroize::Zeroize;
             let mut password = password;
-            let _ = tx.send(VaultTaskMsg::Progress("正在派生密钥并并行加密中...".into()));
-            let res = vault::lock(&path, &password);
+            let tx_mutex = std::sync::Arc::new(std::sync::Mutex::new(tx));
+            let tx_prog = tx_mutex.clone();
+            let folder_prog = target_path.clone();
+
+            let res = vault::lock_with_progress(&target_path, &password, move |completed, total, current_file, file_size| {
+                if let Ok(tx) = tx_prog.lock() {
+                    let _ = tx.send(VaultTaskMsg::EncryptProgress(EncryptProgressInfo {
+                        folder: folder_prog.clone(),
+                        completed,
+                        total,
+                        current_file: current_file.to_string(),
+                        file_size,
+                    }));
+                }
+            });
+
             password.zeroize();
-            match res {
-                Ok(_) => {
-                    let _ = tx.send(VaultTaskMsg::Success("✅ 文件夹已成功加密锁定！".into()));
+            if let Ok(tx) = tx_mutex.lock() {
+                match res {
+                    Ok(_) => {
+                        let _ = tx.send(VaultTaskMsg::Success("✅ 文件夹已成功加密锁定！".into()));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(VaultTaskMsg::Error(e.to_string()));
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.send(VaultTaskMsg::Error(e.to_string()));
-                }
-            }
+            };
         });
     }
 
     fn start_unlock_task(&mut self, path: &Path) {
         let path = path.to_path_buf();
-        // Immediately clear input fields upon clicking unlock
         let password = std::mem::take(&mut self.password);
         self.confirm_password.clear();
         let tx = self.tx.clone();
@@ -3155,20 +4062,178 @@ impl SecureVaultApp {
         // Add to session unlocked set
         self.unlocked_during_session.insert(path.clone());
 
+        let target_path = path.clone();
+        self.active_progress = Some(ActiveProgressState {
+            folder: path.clone(),
+            is_decrypt: true,
+            completed: 0,
+            total: 0,
+            current_file: String::new(),
+            recent_files: Vec::new(),
+            total_bytes_done: 0,
+        });
+
         thread::spawn(move || {
             use zeroize::Zeroize;
             let mut password = password;
-            let _ = tx.send(VaultTaskMsg::Progress("正在校验密码并还原所有文件中...".into()));
-            let res = vault::unlock(&path, &password);
-            password.zeroize();
-            match res {
-                Ok(_) => {
-                    let _ = tx.send(VaultTaskMsg::Success("✅ 文件夹已成功解密还原！".into()));
+            let tx_mutex = std::sync::Arc::new(std::sync::Mutex::new(tx));
+            let tx_prog = tx_mutex.clone();
+            let folder_prog = target_path.clone();
+
+            let res = vault::unlock_with_progress(&target_path, &password, move |completed, total, current_file, file_size| {
+                if let Ok(tx) = tx_prog.lock() {
+                    let _ = tx.send(VaultTaskMsg::DecryptProgress(DecryptProgressInfo {
+                        folder: folder_prog.clone(),
+                        completed,
+                        total,
+                        current_file: current_file.to_string(),
+                        file_size,
+                    }));
                 }
-                Err(e) => {
-                    let _ = tx.send(VaultTaskMsg::Error(e.to_string()));
+            });
+
+            password.zeroize();
+            if let Ok(tx) = tx_mutex.lock() {
+                match res {
+                    Ok(report) => {
+                        if report.is_complete() {
+                            let _ = tx.send(VaultTaskMsg::Success(
+                                format!("✅ 文件夹已成功解密还原！共恢复 {} 个文件。", report.restored.len())
+                            ));
+                        } else {
+                            let failed_list: Vec<String> = report.failed.iter()
+                                .map(|(path, err)| format!("  • {} — {}", path, err))
+                                .collect();
+                            let _ = tx.send(VaultTaskMsg::Success(
+                                format!(
+                                    "⚠️ 部分解密完成：{} 个文件成功恢复，{} 个文件解密失败。\n失败文件：\n{}\n💡 加密数据已保留，可修复后重试。",
+                                    report.restored.len(),
+                                    report.failed.len(),
+                                    failed_list.join("\n")
+                                )
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(VaultTaskMsg::Error(e.to_string()));
+                    }
+                }
+            };
+        });
+    }
+
+    fn start_batch_task(&mut self, mode: BatchMode, folders: Vec<TrackedVault>, password: String) {
+        self.is_busy = true;
+        self.status_message = None;
+        let is_encrypt = mode == BatchMode::Encrypt;
+        let action = if is_encrypt { "加密" } else { "解密" };
+        self.progress_text = format!("正在准备批量{}...", action);
+        self.batch_running_info = Some(BatchProgressInfo {
+            current_folder_index: 0,
+            total_folders: folders.len(),
+            folder_name: folders.first().map(|f| f.name.clone()).unwrap_or_default(),
+            folder_path: folders.first().map(|f| f.path.clone()).unwrap_or_default(),
+            is_encrypt,
+            folder_completed: 0,
+            folder_total: 0,
+            current_file: String::new(),
+            file_size: 0,
+        });
+
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            use zeroize::Zeroize;
+            let mut password = password;
+            let total = folders.len();
+            let mut success_count = 0;
+            let mut fail_count = 0;
+            let tx_mutex = std::sync::Arc::new(std::sync::Mutex::new(tx));
+
+            for (idx, vault_item) in folders.iter().enumerate() {
+                let folder_path = vault_item.path.clone();
+                let folder_name = vault_item.name.clone();
+
+                if let Ok(tx) = tx_mutex.lock() {
+                    let _ = tx.send(VaultTaskMsg::BatchProgress(BatchProgressInfo {
+                        current_folder_index: idx,
+                        total_folders: total,
+                        folder_name: folder_name.clone(),
+                        folder_path: folder_path.clone(),
+                        is_encrypt,
+                        folder_completed: 0,
+                        folder_total: 0,
+                        current_file: String::new(),
+                        file_size: 0,
+                    }));
+                }
+
+                let tx_prog = tx_mutex.clone();
+                let f_name = folder_name.clone();
+                let f_path = folder_path.clone();
+
+                let res: Result<(), anyhow::Error> = if is_encrypt {
+                    vault::lock_with_progress(&folder_path, &password, move |completed, ftotal, file_path, file_size| {
+                        if let Ok(tx) = tx_prog.lock() {
+                            let _ = tx.send(VaultTaskMsg::BatchProgress(BatchProgressInfo {
+                                current_folder_index: idx,
+                                total_folders: total,
+                                folder_name: f_name.clone(),
+                                folder_path: f_path.clone(),
+                                is_encrypt: true,
+                                folder_completed: completed,
+                                folder_total: ftotal,
+                                current_file: file_path.to_string(),
+                                file_size,
+                            }));
+                        }
+                    })
+                } else {
+                    vault::unlock_with_progress(&folder_path, &password, move |completed, ftotal, file_path, file_size| {
+                        if let Ok(tx) = tx_prog.lock() {
+                            let _ = tx.send(VaultTaskMsg::BatchProgress(BatchProgressInfo {
+                                current_folder_index: idx,
+                                total_folders: total,
+                                folder_name: f_name.clone(),
+                                folder_path: f_path.clone(),
+                                is_encrypt: false,
+                                folder_completed: completed,
+                                folder_total: ftotal,
+                                current_file: file_path.to_string(),
+                                file_size,
+                            }));
+                        }
+                    }).map(|_report| ())
+                };
+
+                let res_for_msg = match res {
+                    Ok(_) => {
+                        success_count += 1;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        fail_count += 1;
+                        Err(e.to_string())
+                    }
+                };
+
+                if let Ok(tx) = tx_mutex.lock() {
+                    let _ = tx.send(VaultTaskMsg::BatchFolderCompleted {
+                        folder: folder_path,
+                        is_encrypt,
+                        result: res_for_msg,
+                    });
                 }
             }
+
+            password.zeroize();
+            if let Ok(tx) = tx_mutex.lock() {
+                let _ = tx.send(VaultTaskMsg::BatchAllCompleted {
+                    total,
+                    success_count,
+                    fail_count,
+                    is_encrypt,
+                });
+            };
         });
     }
 
@@ -3225,8 +4290,14 @@ mod tests {
     #[test]
     fn test_load_system_font() {
         let candidate_paths = [
+            // Windows
             "C:\\Windows\\Fonts\\msyh.ttc",
             "C:\\Windows\\Fonts\\simhei.ttf",
+            // macOS
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Songti.ttc",
         ];
         let mut loaded = false;
         for path in candidate_paths {

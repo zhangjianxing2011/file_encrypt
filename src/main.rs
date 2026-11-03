@@ -82,7 +82,18 @@ fn main() -> Result<()> {
                 Some(p) => p,
                 None => prompt_password("Enter password: ")?,
             };
-            vault::unlock(&path, &pwd)?;
+            let report = vault::unlock(&path, &pwd)?;
+            if !report.is_complete() {
+                eprintln!(
+                    "⚠️  {} file(s) failed to decrypt:",
+                    report.failed.len()
+                );
+                for (path, err) in &report.failed {
+                    eprintln!("  ❌ {} — {}", path, err);
+                }
+                eprintln!("💡 Successfully restored {} file(s). Encrypted vault preserved for failed files.",
+                    report.restored.len());
+            }
         }
         Some(Commands::Append { path }) => {
             let password = Zeroizing::new(rpassword::prompt_password("Enter existing password: ")?);

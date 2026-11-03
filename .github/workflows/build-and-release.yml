@@ -73,6 +73,8 @@ jobs:
         run: |
           chmod +x package_mac.sh
           ./package_mac.sh target/release/securevault
+          # 移除隔离属性，防止下载后 Gatekeeper 报"已损坏"
+          xattr -cr SecureVault.app 2>/dev/null || true
           cp SecureVault.dmg SecureVault-macOS.dmg
 
       - name: Upload macOS Artifacts

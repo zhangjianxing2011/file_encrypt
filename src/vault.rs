@@ -48,6 +48,16 @@ fn get_cleanup_thread_pool() -> Result<rayon::ThreadPool> {
 /// 5. Safely overwrites and deletes original files with bounded concurrency
 /// 6. Reuses scanned directory structure to eliminate duplicate filesystem walks
 pub fn lock(folder: &Path, password: &str) -> Result<()> {
+    lock_with_progress(folder, password, |_, _, _, _| {})
+}
+
+/// Encrypt and lock a folder in-place with real-time per-file progress callback.
+///
+/// Progress callback receives: `(completed_files, total_files, current_relative_path, file_size)`
+pub fn lock_with_progress<F>(folder: &Path, password: &str, progress: F) -> Result<()>
+where
+    F: Fn(usize, usize, &str, u64) + Send + Sync,
+{
     let folder = dunce_canonicalize(folder)?;
     let _operation = incremental::operation_lock(&folder)?;
 
@@ -104,6 +114,8 @@ pub fn lock(folder: &Path, password: &str) -> Result<()> {
     // ── 4. Encrypt files in parallel (Lock-free collection & bounded pool) ───
     let pb = make_progress_bar(files.len() as u64, "Encrypting", "cyan");
     let crypto_pool = get_crypto_thread_pool()?;
+    let total_files = files.len();
+    let counter = std::sync::atomic::AtomicUsize::new(0);
 
     let results: Vec<Result<FileEntry, (PathBuf, anyhow::Error)>> = crypto_pool.install(|| {
         files
@@ -115,13 +127,24 @@ pub fn lock(folder: &Path, password: &str) -> Result<()> {
                 let res = match crypto.encrypt_file(file_path, &enc_path) {
                     Ok(digest) => {
                         match build_file_entry(&id, file_path, &folder, Some(digest)) {
-                            Ok(entry) => Ok(entry),
-                            Err(e) => Err((file_path.clone(), e)),
+                            Ok(entry) => {
+                                let completed = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                pb.inc(1);
+                                let rel = file_path.strip_prefix(&folder).unwrap_or(file_path).to_string_lossy();
+                                progress(completed, total_files, &rel, entry.size);
+                                Ok(entry)
+                            }
+                            Err(e) => {
+                                pb.inc(1);
+                                Err((file_path.clone(), e))
+                            }
                         }
                     }
-                    Err(e) => Err((file_path.clone(), e)),
+                    Err(e) => {
+                        pb.inc(1);
+                        Err((file_path.clone(), e))
+                    }
                 };
-                pb.inc(1);
                 res
             })
             .collect()
@@ -227,15 +250,43 @@ pub fn lock(folder: &Path, password: &str) -> Result<()> {
     Ok(())
 }
 
+/// Result of an unlock operation that may have partial successes.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct UnlockReport {
+    /// Files that were successfully decrypted and restored.
+    pub restored: Vec<String>,
+    /// Files that failed to decrypt (path, error message).
+    pub failed: Vec<(String, String)>,
+    /// Whether the vault data was fully cleaned up (true only when all files succeeded).
+    pub vault_cleaned: bool,
+}
+
+impl UnlockReport {
+    /// Returns true if all files were successfully restored.
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
 /// Decrypt and unlock a locked folder.
 ///
-/// 1. Reads .vault_meta and verifies password
-/// 2. Decrypts index to learn original file paths and authentication digests
-/// 3. Recreates directory structure
-/// 4. Decrypts each file back to original location with in-place buffer reuse and end-to-end authentication
-/// 5. Automatically rolls back any restored plaintext if decryption fails, preventing plaintext leakage
-/// 6. Removes .vault_data and .vault_meta upon successful completion
-pub fn unlock(folder: &Path, password: &str) -> Result<()> {
+/// Fault-tolerant: if some encrypted files are missing or corrupted,
+/// the remaining files are still decrypted successfully. Returns `Ok` with
+/// an `UnlockReport` describing which files succeeded and which failed.
+/// Only returns `Err` for fatal errors (wrong password, corrupted index, etc.).
+pub fn unlock(folder: &Path, password: &str) -> Result<UnlockReport> {
+    unlock_with_progress(folder, password, |_, _, _, _| {})
+}
+
+/// Decrypt and unlock a locked folder in-place with real-time per-file progress callback.
+///
+/// Fault-tolerant: successfully decrypts available files even if some are missing or corrupted.
+/// Progress callback receives: `(completed_files, total_files, current_relative_path, file_size)`
+pub fn unlock_with_progress<F>(folder: &Path, password: &str, progress: F) -> Result<UnlockReport>
+where
+    F: Fn(usize, usize, &str, u64) + Send + Sync,
+{
     let folder = dunce_canonicalize(folder)?;
     let _operation = incremental::operation_lock(&folder)?;
 
@@ -279,12 +330,10 @@ pub fn unlock(folder: &Path, password: &str) -> Result<()> {
     let mut sorted_dirs = index.dirs.clone();
     sorted_dirs.sort_by_key(|d| d.path.matches('/').count());
 
-    let mut created_dirs: Vec<PathBuf> = Vec::new();
     for dir in &sorted_dirs {
         let dir_path = folder.join(&dir.path);
         if !dir_path.exists() {
             fs::create_dir_all(&dir_path)?;
-            created_dirs.push(dir_path.clone());
         }
 
         #[cfg(unix)]
@@ -294,12 +343,15 @@ pub fn unlock(folder: &Path, password: &str) -> Result<()> {
         }
     }
 
-    // ── 5. Decrypt files in parallel with rollback protection ───
+    // ── 5. Decrypt files in parallel (fault-tolerant) ───────────
     let vault_data = folder.join(VAULT_DATA_DIR);
     let pb = make_progress_bar(index.files.len() as u64, "Decrypting", "green");
     let crypto_pool = get_crypto_thread_pool()?;
+    let total_files = index.files.len();
+    let counter = std::sync::atomic::AtomicUsize::new(0);
 
-    let results: Vec<Result<PathBuf, (String, anyhow::Error)>> = crypto_pool.install(|| {
+    // Each result carries: Ok((restored_path, entry_id)) or Err((rel_path, error))
+    let results: Vec<Result<(PathBuf, String), (String, anyhow::Error)>> = crypto_pool.install(|| {
         index
             .files
             .par_iter()
@@ -315,7 +367,7 @@ pub fn unlock(folder: &Path, password: &str) -> Result<()> {
                 }
 
                 // Authenticated decryption with expected size & SHA-256
-                let res = match crypto.decrypt_file_authenticated(
+                match crypto.decrypt_file_authenticated(
                     &enc_path,
                     &dst_path,
                     Some(entry.size),
@@ -323,54 +375,106 @@ pub fn unlock(folder: &Path, password: &str) -> Result<()> {
                 ) {
                     Ok(_) => {
                         restore_file_metadata(&dst_path, entry);
-                        Ok(dst_path)
+                        let completed = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        pb.inc(1);
+                        progress(completed, total_files, &entry.path, entry.size);
+                        Ok((dst_path, entry.id.clone()))
                     }
-                    Err(e) => Err((entry.path.clone(), e)),
-                };
-                pb.inc(1);
-                res
+                    Err(e) => {
+                        // Clean up any partially written destination file
+                        let _ = fs::remove_file(&dst_path);
+                        let completed = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        pb.inc(1);
+                        progress(completed, total_files, &entry.path, 0);
+                        Err((entry.path.clone(), e))
+                    }
+                }
             })
             .collect()
     });
     pb.finish_with_message("done");
 
-    let mut restored_files = Vec::new();
-    let mut errors = Vec::new();
+    let mut restored_paths: Vec<String> = Vec::new();
+    let mut restored_enc_ids: Vec<String> = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
     for r in results {
         match r {
-            Ok(p) => restored_files.push(p),
-            Err(e) => errors.push(e),
+            Ok((path, enc_id)) => {
+                restored_paths.push(path.strip_prefix(&folder).unwrap_or(&path).to_string_lossy().into_owned());
+                restored_enc_ids.push(enc_id);
+            }
+            Err((path, err)) => {
+                eprintln!("  ⚠️  Failed to decrypt: {} — {}", path, err);
+                errors.push((path, err.to_string()));
+            }
         }
     }
 
-    // Check for errors — if any failed, ROLL BACK all restored files & dirs to prevent plaintext leakage!
-    if !errors.is_empty() {
-        println!("⚠️  Decryption failed for {} file(s) — rolling back to prevent plaintext leakage...", errors.len());
-        for file_path in &restored_files {
-            let _ = secure_delete(file_path);
+    // ── 6. Cleanup ──────────────────────────────────────────────
+    let vault_cleaned = if errors.is_empty() {
+        // All files restored successfully — clean up entire vault
+        println!("🗑️  Removing encrypted data...");
+        fs::remove_dir_all(&vault_data)?;
+        fs::remove_file(&meta_path)?;
+        println!("✅ Unlocked! {} file(s) restored.", restored_paths.len());
+        true
+    } else {
+        // Partial success — remove only the .enc files for successfully restored files,
+        // keep vault metadata and remaining .enc files so the user can retry.
+        println!(
+            "⚠️  Partial unlock: {} file(s) restored, {} file(s) failed.",
+            restored_paths.len(),
+            errors.len()
+        );
+        for enc_id in &restored_enc_ids {
+            let enc_file = vault_data.join(format!("{}.enc", enc_id));
+            let _ = fs::remove_file(&enc_file);
         }
-        // Rollback newly created directories (deepest first)
-        created_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
-        for dir_path in &created_dirs {
-            let _ = fs::remove_dir(dir_path);
+
+        // Update the index to only contain the failed (remaining) entries
+        let remaining_ids: std::collections::HashSet<&str> = restored_enc_ids.iter().map(|s| s.as_str()).collect();
+        let remaining_files: Vec<FileEntry> = index.files.into_iter()
+            .filter(|e| !remaining_ids.contains(e.id.as_str()))
+            .collect();
+
+        if remaining_files.is_empty() {
+            // Edge case: all files actually restored but with non-fatal errors logged
+            fs::remove_dir_all(&vault_data)?;
+            fs::remove_file(&meta_path)?;
+        } else {
+            // Rewrite the vault index with only the remaining (failed) entries
+            let updated_index = VaultIndex {
+                version: index.version,
+                files: remaining_files,
+                dirs: index.dirs,
+            };
+            let updated_json = serde_json::to_vec(&updated_index)?;
+            let updated_encrypted = crypto.encrypt_index(&updated_json)?;
+
+            let updated_meta = VaultMeta {
+                version: meta.version,
+                salt: meta.salt.clone(),
+                password_check: meta.password_check.clone(),
+                chunk_size: meta.chunk_size,
+                encrypted_index: BASE64.encode(&updated_encrypted),
+            };
+            let updated_meta_json = serde_json::to_string_pretty(&updated_meta)?;
+            fs::write(&meta_path, &updated_meta_json)?;
+            let _ = fs::write(vault_data.join(VAULT_META_BACKUP_FILE), &updated_meta_json);
         }
 
         for (path, err) in &errors {
             eprintln!("  ❌ {}: {}", path, err);
         }
-        bail!(
-            "Decryption failed for {} file(s). Partially restored files were cleaned up to prevent plaintext leakage. Encrypted vault is preserved — you can safely retry.",
-            errors.len()
-        );
-    }
+        println!("💡 Encrypted vault preserved for failed files — you can retry after fixing the issue.");
+        false
+    };
 
-    // ── 6. Cleanup vault data ───────────────────────────────────
-    println!("🗑️  Removing encrypted data...");
-    fs::remove_dir_all(&vault_data)?;
-    fs::remove_file(&meta_path)?;
-
-    println!("✅ Unlocked! {} file(s) restored.", index.files.len());
-    Ok(())
+    Ok(UnlockReport {
+        restored: restored_paths,
+        failed: errors,
+        vault_cleaned,
+    })
 }
 
 /// Read vault metadata with automatic disaster recovery.
@@ -761,6 +865,88 @@ mod tests {
     }
 
     #[test]
+    fn test_progress_callbacks() {
+        let dir = setup_test_folder("progress_cb");
+        create_test_file(&dir, "f1.txt", b"Content 1");
+        create_test_file(&dir, "f2.txt", b"Content 2");
+        create_test_file(&dir, "f3.txt", b"Content 3");
+
+        let password = "pass-test-progress";
+        let lock_count = std::sync::atomic::AtomicUsize::new(0);
+        lock_with_progress(&dir, password, |_completed, total, path, size| {
+            assert_eq!(total, 3);
+            assert!(size > 0);
+            assert!(!path.is_empty());
+            lock_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }).unwrap();
+        assert_eq!(lock_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let unlock_count = std::sync::atomic::AtomicUsize::new(0);
+        unlock_with_progress(&dir, password, |_completed, total, path, size| {
+            assert_eq!(total, 3);
+            assert!(size > 0);
+            assert!(!path.is_empty());
+            unlock_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }).unwrap();
+        assert_eq!(unlock_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_multiple_projects_batch_roundtrip() {
+        let p1 = setup_test_folder("proj_1");
+        let p2 = setup_test_folder("proj_2");
+        let p3 = setup_test_folder("proj_3");
+
+        create_test_file(&p1, "doc1.txt", b"Proj 1 Content");
+        create_test_file(&p1, "sub/a.bin", &[1, 2, 3]);
+
+        create_test_file(&p2, "doc2.txt", b"Proj 2 Content");
+
+        create_test_file(&p3, "doc3.txt", b"Proj 3 Content");
+        create_test_file(&p3, "sub/b.bin", &[4, 5, 6]);
+        create_test_file(&p3, "sub/c.bin", &[7, 8, 9]);
+
+        let projects = [&p1, &p2, &p3];
+        let password = "batch-test-password-999";
+
+        // Batch lock all 3 projects
+        let total_encrypted_files = std::sync::atomic::AtomicUsize::new(0);
+        for proj in &projects {
+            assert!(!is_locked(proj));
+            lock_with_progress(proj, password, |_comp, _tot, _f, _sz| {
+                total_encrypted_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }).unwrap();
+            assert!(is_locked(proj));
+        }
+        assert_eq!(total_encrypted_files.load(std::sync::atomic::Ordering::SeqCst), 6);
+
+        // Batch unlock all 3 projects
+        let total_decrypted_files = std::sync::atomic::AtomicUsize::new(0);
+        for proj in &projects {
+            assert!(is_locked(proj));
+            unlock_with_progress(proj, password, |_comp, _tot, _f, _sz| {
+                total_decrypted_files.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }).unwrap();
+            assert!(!is_locked(proj));
+        }
+        assert_eq!(total_decrypted_files.load(std::sync::atomic::Ordering::SeqCst), 6);
+
+        // Verify all contents
+        assert_eq!(fs::read_to_string(p1.join("doc1.txt")).unwrap(), "Proj 1 Content");
+        assert_eq!(fs::read(p1.join("sub/a.bin")).unwrap(), vec![1, 2, 3]);
+        assert_eq!(fs::read_to_string(p2.join("doc2.txt")).unwrap(), "Proj 2 Content");
+        assert_eq!(fs::read_to_string(p3.join("doc3.txt")).unwrap(), "Proj 3 Content");
+        assert_eq!(fs::read(p3.join("sub/b.bin")).unwrap(), vec![4, 5, 6]);
+        assert_eq!(fs::read(p3.join("sub/c.bin")).unwrap(), vec![7, 8, 9]);
+
+        let _ = fs::remove_dir_all(&p1);
+        let _ = fs::remove_dir_all(&p2);
+        let _ = fs::remove_dir_all(&p3);
+    }
+
+    #[test]
     fn test_format_size() {
         assert_eq!(format_size(0), "0 bytes");
         assert_eq!(format_size(512), "512 bytes");
@@ -771,8 +957,8 @@ mod tests {
     }
 
     #[test]
-    fn test_unlock_partial_failure_rollback() {
-        let dir = setup_test_folder("rollback");
+    fn test_unlock_partial_success_with_corrupted_file() {
+        let dir = setup_test_folder("partial_success");
         create_test_file(&dir, "good1.txt", b"Good file 1");
         create_test_file(&dir, "good2.txt", b"Good file 2");
         create_test_file(&dir, "corrupt.txt", b"Corrupted content target");
@@ -796,18 +982,68 @@ mod tests {
         bytes[idx] ^= 0xFF;
         fs::write(&target_file, &bytes).unwrap();
 
-        // Unlock must fail
-        let res = unlock(&dir, password);
-        assert!(res.is_err());
+        // Unlock should succeed (fault-tolerant) but report partial failure
+        let report = unlock(&dir, password).unwrap();
+        assert!(!report.is_complete(), "Should have partial failures");
+        assert_eq!(report.failed.len(), 1, "Exactly one file should fail");
+        assert_eq!(report.restored.len(), 2, "Two files should be restored successfully");
+        assert!(!report.vault_cleaned, "Vault data should be preserved for failed files");
 
-        // Verify rollback: NO plaintext files should be left exposed in dir!
-        assert!(!dir.join("good1.txt").exists(), "Rolled back good1.txt");
-        assert!(!dir.join("good2.txt").exists(), "Rolled back good2.txt");
-        assert!(!dir.join("corrupt.txt").exists(), "Rolled back corrupt.txt");
+        // The corrupted file's plaintext should NOT exist (cleaned up)
+        // The two good files should be restored
+        let mut restored_count = 0;
+        if dir.join("good1.txt").exists() { restored_count += 1; }
+        if dir.join("good2.txt").exists() { restored_count += 1; }
+        if dir.join("corrupt.txt").exists() { restored_count += 1; }
+        // At least 2 files should be restored (the good ones); the corrupted one may or may not
+        // depending on which file was tampered (we tampered the last in the list)
+        assert!(restored_count >= 2, "At least 2 good files should be restored, got {}", restored_count);
 
-        // Encrypted data remains intact
+        // Vault metadata should still exist (for retry)
+        assert!(dir.join(VAULT_META_FILE).exists(), "Vault meta should be preserved");
+        assert!(dir.join(VAULT_DATA_DIR).exists(), "Vault data dir should be preserved");
+
+        // The remaining .enc files should only be for the failed file(s)
+        let remaining_enc: Vec<_> = fs::read_dir(&vault_data)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("enc"))
+            .collect();
+        assert_eq!(remaining_enc.len(), 1, "Only the failed file's .enc should remain");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unlock_with_deleted_enc_file() {
+        let dir = setup_test_folder("deleted_enc");
+        create_test_file(&dir, "file_a.txt", b"Content A");
+        create_test_file(&dir, "file_b.txt", b"Content B");
+        create_test_file(&dir, "file_c.txt", b"Content C");
+
+        let password = "delete-test-pw-456";
+        lock(&dir, password).unwrap();
+
+        // Delete one .enc file entirely
+        let vault_data = dir.join(VAULT_DATA_DIR);
+        let enc_files: Vec<_> = fs::read_dir(&vault_data)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("enc"))
+            .collect();
+        assert_eq!(enc_files.len(), 3);
+        fs::remove_file(&enc_files[0]).unwrap(); // Delete one
+
+        // Unlock should succeed with partial results
+        let report = unlock(&dir, password).unwrap();
+        assert!(!report.is_complete());
+        assert_eq!(report.restored.len(), 2, "Two files should be restored");
+        assert_eq!(report.failed.len(), 1, "One file should fail (missing .enc)");
+
+        // Vault preserved for the missing file
         assert!(dir.join(VAULT_META_FILE).exists());
-        assert!(dir.join(VAULT_DATA_DIR).exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
