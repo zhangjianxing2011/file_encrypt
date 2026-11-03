@@ -239,7 +239,7 @@ impl CryptoEngine {
             .map_err(|e| anyhow!("Cannot open encrypted file '{}': {}", src.display(), e))?;
         let mut reader = BufReader::new(src_file);
 
-        let dst_file = File::create(dst)
+        let dst_file = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)
             .map_err(|e| anyhow!("Cannot create output file '{}': {}", dst.display(), e))?;
         let mut writer = BufWriter::new(dst_file);
 
@@ -469,6 +469,21 @@ mod tests {
         assert_eq!(content, result.as_slice());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypt_never_truncates_an_existing_output() {
+        let dir = std::env::temp_dir().join(format!("sv_existing_output_{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let src = dir.join("input.enc");
+        let dst = dir.join("existing.txt");
+        fs::write(&src, b"").unwrap();
+        fs::write(&dst, b"newer plaintext").unwrap();
+        let engine = CryptoEngine { index_key: [0; 32], data_key: [0; 32], hmac_key: [0; 32], chunk_size: 1024 };
+        assert!(engine.decrypt_file(&src, &dst).is_err());
+        let remaining = fs::read(&dst).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(remaining, b"newer plaintext");
     }
 
     #[test]

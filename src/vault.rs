@@ -10,6 +10,11 @@ use std::time::SystemTime;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod incremental;
+mod incremental_storage;
+mod incremental_source;
+pub use incremental::append;
+
 // ─── Concurrency Budget Helpers ─────────────────────────────────────
 
 fn get_crypto_thread_pool() -> Result<rayon::ThreadPool> {
@@ -44,6 +49,7 @@ fn get_cleanup_thread_pool() -> Result<rayon::ThreadPool> {
 /// 6. Reuses scanned directory structure to eliminate duplicate filesystem walks
 pub fn lock(folder: &Path, password: &str) -> Result<()> {
     let folder = dunce_canonicalize(folder)?;
+    let _operation = incremental::operation_lock(&folder)?;
 
     ensure!(
         folder.is_dir(),
@@ -231,6 +237,7 @@ pub fn lock(folder: &Path, password: &str) -> Result<()> {
 /// 6. Removes .vault_data and .vault_meta upon successful completion
 pub fn unlock(folder: &Path, password: &str) -> Result<()> {
     let folder = dunce_canonicalize(folder)?;
+    let _operation = incremental::operation_lock(&folder)?;
 
     ensure!(
         folder.is_dir(),
@@ -258,6 +265,8 @@ pub fn unlock(folder: &Path, password: &str) -> Result<()> {
     let encrypted_index = BASE64.decode(&meta.encrypted_index)?;
     let index_json = crypto.decrypt_index(&encrypted_index)?;
     let index: VaultIndex = serde_json::from_slice(&index_json)?;
+
+    incremental::check_restore_targets(&folder, &index)?;
 
     println!(
         "📊 Restoring {} file(s), {} director(ies)",
@@ -410,6 +419,7 @@ fn scan_folder(folder: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             name != VAULT_DATA_DIR && name != VAULT_META_FILE && name != VAULT_META_BACKUP_FILE
+                && name != incremental::OPERATION_LOCK
         })
     {
         let entry = entry?;

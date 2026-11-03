@@ -1,6 +1,6 @@
 [package]
 name = "securevault"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "High-performance cross-platform folder encryption tool"
 license = "MIT"

@@ -95,6 +95,16 @@ pub struct SecureVaultApp {
 pub fn setup_chinese_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
+    // Optically align emoji glyphs with Chinese & Latin text baselines
+    for font_name in ["NotoEmoji-Regular", "emoji-icon-font"] {
+        if let Some(font_data) = fonts.font_data.remove(font_name) {
+            let mut tweaked = (*font_data).clone();
+            tweaked.tweak.y_offset = 1.0;
+            tweaked.tweak.y_offset_factor = 0.08;
+            fonts.font_data.insert(font_name.to_string(), std::sync::Arc::new(tweaked));
+        }
+    }
+
     let candidate_paths = [
         // Windows
         "C:\\Windows\\Fonts\\msyh.ttc",
@@ -155,6 +165,68 @@ pub fn setup_chinese_fonts(ctx: &egui::Context) {
 
 // ── UI Theme & Component Helpers ──
 
+/// Helper to render a perfectly aligned status/badge pill
+fn render_badge_pill(
+    ui: &mut egui::Ui,
+    icon: &str,
+    text: &str,
+    bg: egui::Color32,
+    stroke: egui::Stroke,
+    text_color: egui::Color32,
+    height: f32,
+    clickable: bool,
+) -> egui::Response {
+    let font_size = if height <= 22.0 { 11.0 } else { 12.0 };
+    let font = egui::FontId::proportional(font_size);
+
+    let has_icon = !icon.is_empty();
+    let has_text = !text.is_empty();
+
+    let icon_galley = if has_icon {
+        Some(ui.painter().layout_no_wrap(icon.to_string(), font.clone(), text_color))
+    } else {
+        None
+    };
+    let text_galley = if has_text {
+        Some(ui.painter().layout_no_wrap(text.to_string(), font, text_color))
+    } else {
+        None
+    };
+
+    let spacing = if has_icon && has_text { 4.0 } else { 0.0 };
+    let icon_w = icon_galley.as_ref().map(|g| g.size().x).unwrap_or(0.0);
+    let text_w = text_galley.as_ref().map(|g| g.size().x).unwrap_or(0.0);
+    let pad_x = if height <= 22.0 { 7.0 } else { 9.0 };
+    let total_w = pad_x * 2.0 + icon_w + spacing + text_w;
+
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(total_w, height),
+        if clickable { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+
+    let corner_radius = height / 2.0;
+    ui.painter().rect_filled(rect, corner_radius, bg);
+    if stroke.width > 0.0 {
+        ui.painter().rect_stroke(rect, corner_radius, stroke, egui::StrokeKind::Inside);
+    }
+
+    let target_center_y = rect.center().y;
+    let start_x = rect.min.x + pad_x;
+
+    if let Some(icon_g) = icon_galley {
+        let icon_y = (target_center_y - icon_g.size().y / 2.0).round();
+        ui.painter().galley(egui::pos2(start_x, icon_y), icon_g, text_color);
+    }
+
+    if let Some(text_g) = text_galley {
+        let text_y = (target_center_y - text_g.size().y / 2.0).round();
+        let text_x = if has_icon { start_x + icon_w + spacing } else { start_x };
+        ui.painter().galley(egui::pos2(text_x, text_y), text_g, text_color);
+    }
+
+    resp
+}
+
 /// Status badge pill with custom translucent background and matching border
 fn render_status_pill(ui: &mut egui::Ui, is_locked: bool) {
     let (bg, stroke, text_color, icon, text) = if is_locked {
@@ -175,18 +247,7 @@ fn render_status_pill(ui: &mut egui::Ui, is_locked: bool) {
         )
     };
 
-    egui::Frame::default()
-        .fill(bg)
-        .stroke(stroke)
-        .corner_radius(egui::CornerRadius::same(12))
-        .inner_margin(egui::Margin::symmetric(9, 3))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(3.0, 0.0);
-                ui.label(egui::RichText::new(icon).size(11.0));
-                ui.label(egui::RichText::new(text).size(11.5).strong().color(text_color));
-            });
-        });
+    render_badge_pill(ui, icon, text, bg, stroke, text_color, 24.0, false);
 }
 
 /// Helper to render an icon + text button with pixel-perfect vertical centering
@@ -201,8 +262,47 @@ fn icon_text_button(
     size: egui::Vec2,
     corner_radius: f32,
 ) -> egui::Response {
+    let effective_color = if enabled {
+        text_color
+    } else {
+        egui::Color32::from_rgb(110, 125, 150)
+    };
+
+    let font_size = if size.y <= 24.0 {
+        12.0
+    } else if size.y <= 32.0 {
+        12.5
+    } else {
+        13.0
+    };
+    let font = egui::FontId::proportional(font_size);
+
+    let has_icon = !icon.is_empty();
+    let has_text = !text.is_empty();
+
+    let icon_galley = if has_icon {
+        Some(ui.painter().layout_no_wrap(icon.to_string(), font.clone(), effective_color))
+    } else {
+        None
+    };
+    let text_galley = if has_text {
+        Some(ui.painter().layout_no_wrap(text.to_string(), font, effective_color))
+    } else {
+        None
+    };
+
+    let spacing = if has_icon && has_text { 5.0 } else { 0.0 };
+    let icon_w = icon_galley.as_ref().map(|g| g.size().x).unwrap_or(0.0);
+    let text_w = text_galley.as_ref().map(|g| g.size().x).unwrap_or(0.0);
+    let total_width = icon_w + spacing + text_w;
+
+    let effective_size = egui::vec2(
+        if size.x > 0.0 { size.x.max(total_width + 12.0) } else { total_width + 18.0 },
+        size.y.max(22.0),
+    );
+
     let (rect, resp) = ui.allocate_exact_size(
-        size,
+        effective_size,
         if enabled { egui::Sense::click() } else { egui::Sense::hover() },
     );
 
@@ -230,28 +330,19 @@ fn icon_text_button(
         ui.painter().rect_filled(rect, corner_radius, egui::Color32::from_rgb(32, 40, 54));
     }
 
-    let effective_color = if enabled {
-        text_color
-    } else {
-        egui::Color32::from_rgb(110, 125, 150)
-    };
-
-    let icon_font = egui::FontId::proportional(13.0);
-    let text_font = egui::FontId::proportional(12.5);
-
-    let icon_galley = ui.painter().layout_no_wrap(icon.to_string(), icon_font, effective_color);
-    let text_galley = ui.painter().layout_no_wrap(text.to_string(), text_font, effective_color);
-
-    let spacing = 6.0;
-    let total_width = icon_galley.size().x + spacing + text_galley.size().x;
     let start_x = (rect.min.x + (rect.width() - total_width) / 2.0).round();
+    let target_center_y = rect.center().y;
 
-    // Mathematically center both elements vertically inside the button rect
-    let icon_y = (rect.center().y - icon_galley.size().y / 2.0).round();
-    let text_y = (rect.center().y - text_galley.size().y / 2.0).round();
+    if let Some(icon_g) = icon_galley {
+        let icon_y = (target_center_y - icon_g.size().y / 2.0).round();
+        ui.painter().galley(egui::pos2(start_x, icon_y), icon_g, effective_color);
+    }
 
-    ui.painter().galley(egui::pos2(start_x, icon_y), icon_galley, effective_color);
-    ui.painter().galley(egui::pos2(start_x + total_width - text_galley.size().x, text_y), text_galley, effective_color);
+    if let Some(text_g) = text_galley {
+        let text_y = (target_center_y - text_g.size().y / 2.0).round();
+        let text_x = if has_icon { start_x + icon_w + spacing } else { start_x };
+        ui.painter().galley(egui::pos2(text_x, text_y), text_g, effective_color);
+    }
 
     resp
 }
@@ -320,14 +411,19 @@ fn primary_action_button(ui: &mut egui::Ui, enabled: bool, icon: &str, text: &st
     )
 }
 
-/// Alert message banner (Success or Error)
-fn status_banner(ui: &mut egui::Ui, msg: &str, is_err: bool) {
+/// Alert message banner (Success or Error) with multi-line wrap and action buttons
+fn status_banner(ui: &mut egui::Ui, status_message: &mut Option<(String, bool)>) {
+    let (msg, is_err) = match status_message.as_ref() {
+        Some((m, e)) => (m.clone(), *e),
+        None => return,
+    };
+
     let clean_msg = msg.trim_start_matches('✅').trim_start_matches('❌').trim();
     let (bg, stroke, text_color, icon) = if is_err {
         (
             egui::Color32::from_rgb(46, 18, 22),
             egui::Stroke::new(1.2, egui::Color32::from_rgb(239, 68, 68)),
-            egui::Color32::from_rgb(255, 210, 215),
+            egui::Color32::from_rgb(255, 215, 220),
             "❌",
         )
     } else {
@@ -339,22 +435,135 @@ fn status_banner(ui: &mut egui::Ui, msg: &str, is_err: bool) {
         )
     };
 
+    let is_long_or_multiline = is_err && (clean_msg.starts_with("失败:") || clean_msg.len() > 60 || clean_msg.contains('\n'));
+    let mut should_dismiss = false;
+
     egui::Frame::default()
         .fill(bg)
         .stroke(stroke)
-        .corner_radius(egui::CornerRadius::same(7))
+        .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.label(egui::RichText::new(icon).size(15.0));
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new(clean_msg).size(13.0).strong().color(text_color));
-                },
-            );
+            if is_long_or_multiline {
+                // Header row with Icon, Title, and Action Buttons (Copy + Close)
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{}  操作遇到错误", icon))
+                                .size(13.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(255, 120, 120)),
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Close button
+                            let (close_rect, close_resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                            if close_resp.hovered() {
+                                ui.painter().rect_filled(close_rect, 4.0, egui::Color32::from_rgb(70, 25, 30));
+                            }
+                            ui.painter().text(
+                                close_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "✕",
+                                egui::FontId::proportional(11.0),
+                                if close_resp.hovered() { egui::Color32::WHITE } else { egui::Color32::from_rgb(190, 150, 155) },
+                            );
+                            if close_resp.on_hover_text("关闭错误提示").clicked() {
+                                should_dismiss = true;
+                            }
+
+                            ui.add_space(4.0);
+
+                            // Copy details button
+                            if icon_text_button(
+                                ui,
+                                true,
+                                "📋",
+                                "复制报错",
+                                egui::Color32::from_rgb(60, 25, 32),
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 45, 55)),
+                                egui::Color32::from_rgb(255, 205, 210),
+                                egui::vec2(76.0, 22.0),
+                                4.0,
+                            )
+                            .on_hover_text("复制完整报错内容到剪贴板")
+                            .clicked()
+                            {
+                                ui.ctx().copy_text(clean_msg.to_string());
+                            }
+                        });
+                    },
+                );
+
+                ui.add_space(6.0);
+
+                // Multi-line error detail box with darker background
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(32, 12, 16))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 28, 35)))
+                    .corner_radius(egui::CornerRadius::same(5))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        let text_to_show = clean_msg.strip_prefix("失败:").unwrap_or(clean_msg).trim();
+                        let label = egui::Label::new(
+                            egui::RichText::new(text_to_show)
+                                .size(12.0)
+                                .monospace()
+                                .color(text_color),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Wrap)
+                        .selectable(true);
+
+                        ui.add(label);
+                    });
+            } else {
+                // Single/few line status (e.g. success, or short validation error)
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(
+                        egui::RichText::new(format!("{}  {}", icon, clean_msg))
+                            .size(13.0)
+                            .strong()
+                            .color(text_color),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (close_rect, close_resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+                        if close_resp.hovered() {
+                            let hover_bg = if is_err {
+                                egui::Color32::from_rgb(70, 25, 30)
+                            } else {
+                                egui::Color32::from_rgb(20, 60, 40)
+                            };
+                            ui.painter().rect_filled(close_rect, 4.0, hover_bg);
+                        }
+                        let text_c = if close_resp.hovered() {
+                            egui::Color32::WHITE
+                        } else if is_err {
+                            egui::Color32::from_rgb(190, 150, 155)
+                        } else {
+                            egui::Color32::from_rgb(140, 185, 160)
+                        };
+                        ui.painter().text(
+                            close_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "✕",
+                            egui::FontId::proportional(11.0),
+                            text_c,
+                        );
+                        if close_resp.on_hover_text("关闭提示").clicked() {
+                            should_dismiss = true;
+                        }
+                    });
+                });
+            }
         });
+
+    if should_dismiss {
+        *status_message = None;
+    }
 }
 
 /// Metric card helper for the Details view
@@ -368,11 +577,13 @@ fn metric_card(ui: &mut egui::Ui, icon: &str, title: &str, value: &str, subtitle
         .show(ui, |ui| {
             ui.set_width((width - pad_x * 2.0).max(60.0));
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(icon).size(15.0));
-                ui.add_space(2.0);
-                ui.label(egui::RichText::new(title).size(11.5).weak());
+                ui.label(
+                    egui::RichText::new(format!("{}  {}", icon, title))
+                        .size(12.0)
+                        .weak(),
+                );
             });
-            ui.add_space(3.0);
+            ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(value)
                     .size(14.0)
@@ -668,11 +879,9 @@ fn render_file_tree(
                     // 2. Folder icon and name clickable button
                     let folder_locked = vault::is_locked(&node.path);
                     let folder_icon = if folder_locked { "🔒" } else { "📁" };
-                    ui.label(egui::RichText::new(folder_icon).size(13.0));
-                    ui.add_space(2.0);
 
                     let folder_btn = egui::Button::new(
-                        egui::RichText::new(&node.name)
+                        egui::RichText::new(format!("{}  {}", folder_icon, node.name))
                             .size(11.5)
                             .strong()
                             .color(if is_this_selected {
@@ -766,11 +975,8 @@ fn render_file_tree(
                         _ => "📄",
                     };
 
-                    ui.label(egui::RichText::new(file_icon).size(12.0));
-                    ui.add_space(2.0);
-
                     let file_btn = egui::Button::new(
-                        egui::RichText::new(&node.name)
+                        egui::RichText::new(format!("{}  {}", file_icon, node.name))
                             .size(11.0)
                             .color(if is_this_selected {
                                 egui::Color32::WHITE
@@ -1056,12 +1262,12 @@ impl eframe::App for SecureVaultApp {
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.label(
-                            egui::RichText::new("🔐 SecureVault")
+                            egui::RichText::new("🔐  SecureVault")
                                 .size(16.0)
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         );
-                        ui.add_space(6.0);
+                        ui.add_space(8.0);
 
                         // Version tag
                         egui::Frame::default()
@@ -1096,9 +1302,9 @@ impl eframe::App for SecureVaultApp {
 
         // ── Left Sidebar (Takes full left column height from top to bottom) ──
         egui::Panel::left("left_sidebar")
-            .default_size(320.0)
-            .min_size(260.0)
-            .max_size(520.0)
+            .default_size(384.0)
+            .min_size(312.0)
+            .max_size(650.0)
             .resizable(true)
             .frame(
                 egui::Frame::default()
@@ -1146,9 +1352,8 @@ impl SecureVaultApp {
             egui::vec2(ui.available_width(), 26.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(egui::RichText::new("📁").size(14.0));
-                ui.add_space(3.0);
-                ui.label(egui::RichText::new("受保护文件夹").strong().size(13.0));
+                ui.label(egui::RichText::new("📁  受保护文件夹").strong().size(13.0));
+                ui.add_space(4.0);
                 let count = self.tracked_vaults.len();
                 egui::Frame::default()
                     .fill(egui::Color32::from_rgb(30, 38, 54))
@@ -1336,20 +1541,18 @@ impl SecureVaultApp {
                                         ("🔓", "未锁定", egui::Color32::from_rgb(245, 158, 11), egui::Color32::from_rgb(255, 246, 214), egui::Color32::from_rgb(48, 34, 10))
                                     };
 
-                                    let badge_resp = egui::Frame::default()
-                                        .fill(status_bg)
-                                        .stroke(egui::Stroke::new(1.0, status_border))
-                                        .corner_radius(egui::CornerRadius::same(11))
-                                        .inner_margin(egui::Margin::symmetric(7, 3))
-                                        .show(ui, |ui| {
-                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                                ui.label(egui::RichText::new(status_icon).size(10.5));
-                                                ui.add_space(2.0);
-                                                ui.label(egui::RichText::new(status_text).size(11.0).strong().color(status_text_color));
-                                            });
-                                        });
+                                    let badge_resp = render_badge_pill(
+                                        ui,
+                                        status_icon,
+                                        status_text,
+                                        status_bg,
+                                        egui::Stroke::new(1.0, status_border),
+                                        status_text_color,
+                                        22.0,
+                                        true,
+                                    );
 
-                                    if ui.interact(badge_resp.response.rect, badge_resp.response.id.with("badge_click"), egui::Sense::click())
+                                    if badge_resp
                                         .on_hover_text("点击选中此保险箱并在右侧进行加解密操作")
                                         .clicked()
                                     {
@@ -1468,10 +1671,8 @@ impl SecureVaultApp {
                                                     arrow_color,
                                                 );
 
-                                                ui.label(egui::RichText::new("📦").size(12.0));
-                                                ui.add_space(2.0);
                                                 let btn = egui::Button::new(
-                                                    egui::RichText::new("密文存储区 (.vault_data)")
+                                                    egui::RichText::new("📦  密文存储区 (.vault_data)")
                                                         .size(11.5)
                                                         .strong()
                                                         .color(if is_data_selected {
@@ -1522,10 +1723,8 @@ impl SecureVaultApp {
                                                             egui::vec2(ui.available_width(), 20.0),
                                                             egui::Layout::left_to_right(egui::Align::Center),
                                                             |ui| {
-                                                                ui.label(egui::RichText::new("🔒").size(10.5));
-                                                                ui.add_space(2.0);
                                                                 let enc_btn = egui::Button::new(
-                                                                    egui::RichText::new(fname)
+                                                                    egui::RichText::new(format!("🔒  {}", fname))
                                                                         .size(10.5)
                                                                         .monospace()
                                                                         .color(if is_enc_selected {
@@ -1565,9 +1764,7 @@ impl SecureVaultApp {
                                             egui::vec2(ui.available_width(), 20.0),
                                             egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
-                                                ui.label(egui::RichText::new("📂").size(12.0));
-                                                ui.add_space(2.0);
-                                                ui.label(egui::RichText::new("明文目录清单:").size(11.5).strong());
+                                                ui.label(egui::RichText::new("📂  明文目录清单:").size(11.5).strong());
                                                 ui.colored_label(
                                                     egui::Color32::from_rgb(255, 235, 170),
                                                     format!("{} 文件, {} 目录 ({})", insp.total_plain_files, insp.total_plain_dirs, format_bytes(insp.total_plain_bytes)),
@@ -1700,24 +1897,24 @@ impl SecureVaultApp {
                 ui.set_width(430.0);
                 ui.add_space(4.0);
 
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("❓").size(24.0));
-                    ui.add_space(4.0);
-                    ui.vertical(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 24.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
                         ui.label(
-                            egui::RichText::new("确定要从软件管理列表中移除此文件夹吗？")
+                            egui::RichText::new("❓  确定要从软件管理列表中移除此文件夹吗？")
                                 .strong()
                                 .size(14.5)
                                 .color(egui::Color32::WHITE),
                         );
-                        ui.add_space(3.0);
-                        ui.label(
-                            egui::RichText::new("仅从软件界面监控列表中移除记录，不会删除或修改您磁盘上的任何文件。")
-                                .size(11.5)
-                                .color(egui::Color32::from_rgb(140, 160, 185)),
-                        );
-                    });
-                });
+                    },
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("仅从软件界面监控列表中移除记录，不会删除或修改您磁盘上的任何文件。")
+                        .size(11.5)
+                        .color(egui::Color32::from_rgb(140, 160, 185)),
+                );
 
                 ui.add_space(12.0);
 
@@ -1727,17 +1924,25 @@ impl SecureVaultApp {
                     .corner_radius(egui::CornerRadius::same(6))
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("📁").size(12.0));
-                            ui.label(egui::RichText::new("文件夹名称:").size(12.0).weak());
-                            ui.label(egui::RichText::new(&vault.name).size(13.0).strong().color(egui::Color32::from_rgb(220, 235, 255)));
-                        });
-                        ui.add_space(3.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("📍").size(12.0));
-                            ui.label(egui::RichText::new("本地路径:").size(12.0).weak());
-                            ui.label(egui::RichText::new(vault.path.to_string_lossy()).size(11.0).monospace().color(egui::Color32::from_rgb(155, 175, 205)));
-                        });
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new("📁  文件夹名称:").size(12.0).weak());
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(&vault.name).size(13.0).strong().color(egui::Color32::from_rgb(220, 235, 255)));
+                            },
+                        );
+                        ui.add_space(4.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new("📍  本地路径:").size(12.0).weak());
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(vault.path.to_string_lossy()).size(11.0).monospace().color(egui::Color32::from_rgb(155, 175, 205)));
+                            },
+                        );
                     });
 
                 ui.add_space(16.0);
@@ -1877,119 +2082,119 @@ impl SecureVaultApp {
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let folder_icon = if is_locked {
-                            "🔒"
-                        } else if is_subfolder {
-                            "📁"
-                        } else {
-                            "📂"
-                        };
-                        ui.label(egui::RichText::new(folder_icon).size(24.0));
-                        ui.add_space(6.0);
-                        ui.vertical(|ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 26.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(&self.selected_name)
-                                            .size(16.5)
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
-                                    );
-                                    if is_subfolder {
-                                        ui.add_space(6.0);
-                                        egui::Frame::default()
-                                            .fill(egui::Color32::from_rgb(30, 45, 75))
-                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246)))
-                                            .corner_radius(egui::CornerRadius::same(10))
-                                            .inner_margin(egui::Margin::symmetric(7, 2))
-                                            .show(ui, |ui| {
-                                                ui.label(
-                                                    egui::RichText::new("📁 子目录")
-                                                        .size(10.5)
-                                                        .strong()
-                                                        .color(egui::Color32::from_rgb(147, 197, 253)),
-                                                );
-                                            });
-                                    }
-                                    ui.add_space(8.0);
-                                    render_status_pill(ui, is_locked);
-                                },
-                            );
-                            ui.add_space(3.0);
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 24.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(self.selected_path.to_string_lossy())
-                                                .monospace()
-                                                .size(11.5)
-                                                .color(egui::Color32::from_rgb(155, 175, 205)),
-                                        )
-                                        .truncate(),
-                                    );
-                                    ui.add_space(8.0);
-                                    if icon_text_button(
-                                        ui,
-                                        true,
-                                        "📋",
-                                        "复制路径",
-                                        egui::Color32::from_rgb(28, 36, 50),
-                                        egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
-                                        egui::Color32::from_rgb(200, 215, 235),
-                                        egui::vec2(80.0, 22.0),
-                                        4.0,
-                                    )
-                                    .clicked()
-                                    {
-                                        ui.ctx().copy_text(self.selected_path.to_string_lossy().to_string());
-                                        self.status_message = Some(("已将文件夹路径复制到剪贴板".into(), false));
-                                    }
-                                    if icon_text_button(
-                                        ui,
-                                        true,
-                                        "↗",
-                                        "打开目录",
-                                        egui::Color32::from_rgb(28, 36, 50),
-                                        egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
-                                        egui::Color32::from_rgb(200, 215, 235),
-                                        egui::vec2(80.0, 22.0),
-                                        4.0,
-                                    )
-                                    .on_hover_text("在系统文件管理器中打开此文件夹")
-                                    .clicked()
-                                    {
-                                        open_in_file_manager(&self.selected_path);
-                                    }
+                    let folder_icon = if is_locked {
+                        "🔒"
+                    } else if is_subfolder {
+                        "📁"
+                    } else {
+                        "📂"
+                    };
 
-                                    if is_subfolder {
-                                        if let Some(parent) = &parent_vault {
-                                            ui.add_space(4.0);
-                                            if icon_text_button(
-                                                ui,
-                                                true,
-                                                "↩",
-                                                &format!("返回主文件夹: {}", parent.name),
-                                                egui::Color32::from_rgb(32, 45, 66),
-                                                egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 80, 115)),
-                                                egui::Color32::from_rgb(180, 210, 255),
-                                                egui::vec2(0.0, 22.0),
-                                                4.0,
-                                            )
-                                            .on_hover_text("返回所属的主文件夹")
-                                            .clicked()
-                                            {
-                                                return_to_parent = Some((parent.path.clone(), parent.name.clone(), self.selected_index));
-                                            }
+                    ui.vertical(|ui| {
+                        // Row 1: Folder icon + Name + Subfolder Tag + Status Pill
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 26.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new(folder_icon).size(18.0));
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(&self.selected_name)
+                                        .size(16.5)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                if is_subfolder {
+                                    ui.add_space(6.0);
+                                    render_badge_pill(
+                                        ui,
+                                        "📁",
+                                        "子目录",
+                                        egui::Color32::from_rgb(30, 45, 75),
+                                        egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246)),
+                                        egui::Color32::from_rgb(147, 197, 253),
+                                        22.0,
+                                        false,
+                                    );
+                                }
+                                ui.add_space(8.0);
+                                render_status_pill(ui, is_locked);
+                            },
+                        );
+
+                        ui.add_space(5.0);
+
+                        // Row 2: Path text + [Copy Path] + [Open Folder] + [Back to Parent]
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 24.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(self.selected_path.to_string_lossy())
+                                            .monospace()
+                                            .size(11.5)
+                                            .color(egui::Color32::from_rgb(155, 175, 205)),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add_space(8.0);
+                                if icon_text_button(
+                                    ui,
+                                    true,
+                                    "📋",
+                                    "复制路径",
+                                    egui::Color32::from_rgb(28, 36, 50),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
+                                    egui::Color32::from_rgb(200, 215, 235),
+                                    egui::vec2(82.0, 24.0),
+                                    4.0,
+                                )
+                                .clicked()
+                                {
+                                    ui.ctx().copy_text(self.selected_path.to_string_lossy().to_string());
+                                    self.status_message = Some(("已将文件夹路径复制到剪贴板".into(), false));
+                                }
+                                if icon_text_button(
+                                    ui,
+                                    true,
+                                    "↗",
+                                    "打开目录",
+                                    egui::Color32::from_rgb(28, 36, 50),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
+                                    egui::Color32::from_rgb(200, 215, 235),
+                                    egui::vec2(82.0, 24.0),
+                                    4.0,
+                                )
+                                .on_hover_text("在系统文件管理器中打开此文件夹")
+                                .clicked()
+                                {
+                                    open_in_file_manager(&self.selected_path);
+                                }
+
+                                if is_subfolder {
+                                    if let Some(parent) = &parent_vault {
+                                        ui.add_space(4.0);
+                                        if icon_text_button(
+                                            ui,
+                                            true,
+                                            "↩",
+                                            &format!("返回主文件夹: {}", parent.name),
+                                            egui::Color32::from_rgb(32, 45, 66),
+                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 80, 115)),
+                                            egui::Color32::from_rgb(180, 210, 255),
+                                            egui::vec2(0.0, 24.0),
+                                            4.0,
+                                        )
+                                        .on_hover_text("返回所属的主文件夹")
+                                        .clicked()
+                                        {
+                                            return_to_parent = Some((parent.path.clone(), parent.name.clone(), self.selected_index));
                                         }
                                     }
-                                },
-                            );
-                        });
+                                }
+                            },
+                        );
                     });
                 });
 
@@ -2031,22 +2236,8 @@ impl SecureVaultApp {
                     match self.active_tab {
                         ActiveTab::Lock => {
                             if is_locked {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(ui.available_width(), 24.0),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(egui::RichText::new("🔒").size(14.0));
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            egui::RichText::new("该文件夹当前已经是加密锁定状态，无需重复加密。")
-                                                .size(13.0)
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(52, 211, 153)),
-                                        );
-                                    },
-                                );
-                                ui.add_space(4.0);
-                                ui.label("如需更换密码，请先切换至【🔓 解密还原】标签解密还原，再重新设置新密码加密。");
+                                let target_path = self.selected_path.clone();
+                                self.ui_append_panel(ui, &target_path);
                             } else {
                                 ui.label(
                                     egui::RichText::new(format!(
@@ -2130,10 +2321,8 @@ impl SecureVaultApp {
                                     egui::vec2(ui.available_width(), 24.0),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
-                                        ui.label(egui::RichText::new("🔓").size(14.0));
-                                        ui.add_space(4.0);
                                         ui.label(
-                                            egui::RichText::new("该文件夹当前已处于明文解密状态，文件可正常访问与编辑。")
+                                            egui::RichText::new("🔓  该文件夹当前已处于明文解密状态，文件可正常访问与编辑。")
                                                 .size(13.0)
                                                 .strong()
                                                 .color(egui::Color32::from_rgb(255, 235, 170)),
@@ -2141,6 +2330,14 @@ impl SecureVaultApp {
                                     },
                                 );
                             } else {
+                                if ui.add_enabled(!self.is_busy, egui::Button::new("继续加密新增文件 →")).clicked() {
+                                    self.active_tab = ActiveTab::Lock;
+                                    self.password.clear();
+                                    self.confirm_password.clear();
+                                    self.show_password = false;
+                                    self.status_message = None;
+                                }
+                                ui.add_space(8.0);
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "请输入为【{}】加密时设置的密码进行解密还原：",
@@ -2242,10 +2439,8 @@ impl SecureVaultApp {
                                             egui::vec2(ui.available_width(), 20.0),
                                             egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
-                                                ui.label(egui::RichText::new("⚙️").size(13.0));
-                                                ui.add_space(3.0);
                                                 ui.label(
-                                                    egui::RichText::new("保险箱安全规格与保护机制")
+                                                    egui::RichText::new("⚙️  保险箱安全规格与保护机制")
                                                         .strong()
                                                         .size(12.5)
                                                         .color(egui::Color32::from_rgb(220, 235, 255)),
@@ -2294,136 +2489,125 @@ impl SecureVaultApp {
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let file_icon = if is_enc_file { "🔒" } else { "📄" };
-                        ui.label(egui::RichText::new(file_icon).size(24.0));
-                        ui.add_space(6.0);
-                        ui.vertical(|ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 26.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(&self.selected_name)
-                                            .size(16.5)
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
+                    let file_icon = if is_enc_file { "🔒" } else { "📄" };
+
+                    ui.vertical(|ui| {
+                        // Row 1: File icon + Name + Status Pill
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 26.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new(file_icon).size(18.0));
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(&self.selected_name)
+                                        .size(16.5)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.add_space(8.0);
+                                if is_enc_file {
+                                    render_badge_pill(
+                                        ui,
+                                        "🔒",
+                                        "密文数据块 (AES-256-GCM)",
+                                        egui::Color32::from_rgb(12, 42, 28),
+                                        egui::Stroke::new(1.0, egui::Color32::from_rgb(16, 185, 129)),
+                                        egui::Color32::from_rgb(230, 255, 245),
+                                        22.0,
+                                        false,
                                     );
-                                    ui.add_space(8.0);
-                                    if is_enc_file {
-                                        egui::Frame::default()
-                                            .fill(egui::Color32::from_rgb(12, 42, 28))
-                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(16, 185, 129)))
-                                            .corner_radius(egui::CornerRadius::same(11))
-                                            .inner_margin(egui::Margin::symmetric(7, 3))
-                                            .show(ui, |ui| {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(egui::RichText::new("🔒").size(10.5));
-                                                    ui.add_space(2.0);
-                                                    ui.label(
-                                                        egui::RichText::new("密文数据块 (AES-256-GCM)")
-                                                            .size(11.0)
-                                                            .strong()
-                                                            .color(egui::Color32::from_rgb(230, 255, 245)),
-                                                    );
-                                                });
-                                            });
-                                    } else {
-                                        egui::Frame::default()
-                                            .fill(egui::Color32::from_rgb(48, 34, 10))
-                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(245, 158, 11)))
-                                            .corner_radius(egui::CornerRadius::same(11))
-                                            .inner_margin(egui::Margin::symmetric(7, 3))
-                                            .show(ui, |ui| {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(egui::RichText::new("📄").size(10.5));
-                                                    ui.add_space(2.0);
-                                                    ui.label(
-                                                        egui::RichText::new("明文文件 (未锁定)")
-                                                            .size(11.0)
-                                                            .strong()
-                                                            .color(egui::Color32::from_rgb(255, 246, 214)),
-                                                    );
-                                                });
-                                            });
-                                    }
-                                },
-                            );
-                            ui.add_space(3.0);
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 24.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(self.selected_path.to_string_lossy())
-                                                .monospace()
-                                                .size(11.5)
-                                                .color(egui::Color32::from_rgb(155, 175, 205)),
-                                        )
-                                        .truncate(),
+                                } else {
+                                    render_badge_pill(
+                                        ui,
+                                        "📄",
+                                        "明文文件 (未锁定)",
+                                        egui::Color32::from_rgb(48, 34, 10),
+                                        egui::Stroke::new(1.0, egui::Color32::from_rgb(245, 158, 11)),
+                                        egui::Color32::from_rgb(255, 246, 214),
+                                        22.0,
+                                        false,
                                     );
-                                    ui.add_space(8.0);
+                                }
+                            },
+                        );
+
+                        ui.add_space(4.0);
+
+                        // Row 2: Monospace path + Action buttons (aligned at 22px height)
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 24.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(self.selected_path.to_string_lossy())
+                                            .monospace()
+                                            .size(11.5)
+                                            .color(egui::Color32::from_rgb(155, 175, 205)),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add_space(8.0);
+                                if icon_text_button(
+                                    ui,
+                                    true,
+                                    "📋",
+                                    "复制路径",
+                                    egui::Color32::from_rgb(28, 36, 50),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
+                                    egui::Color32::from_rgb(200, 215, 235),
+                                    egui::vec2(80.0, 22.0),
+                                    4.0,
+                                )
+                                .clicked()
+                                {
+                                    ui.ctx().copy_text(self.selected_path.to_string_lossy().to_string());
+                                    self.status_message = Some(("已将文件路径复制到剪贴板".into(), false));
+                                }
+
+                                if !is_enc_file {
                                     if icon_text_button(
                                         ui,
                                         true,
-                                        "📋",
-                                        "复制路径",
+                                        "↗",
+                                        "打开所在目录",
                                         egui::Color32::from_rgb(28, 36, 50),
                                         egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
                                         egui::Color32::from_rgb(200, 215, 235),
-                                        egui::vec2(80.0, 22.0),
+                                        egui::vec2(100.0, 22.0),
                                         4.0,
                                     )
+                                    .on_hover_text("在系统文件管理器中定位该文件")
                                     .clicked()
                                     {
-                                        ui.ctx().copy_text(self.selected_path.to_string_lossy().to_string());
-                                        self.status_message = Some(("已将文件路径复制到剪贴板".into(), false));
-                                    }
-
-                                    if !is_enc_file {
-                                        if icon_text_button(
-                                            ui,
-                                            true,
-                                            "↗",
-                                            "打开所在目录",
-                                            egui::Color32::from_rgb(28, 36, 50),
-                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
-                                            egui::Color32::from_rgb(200, 215, 235),
-                                            egui::vec2(100.0, 22.0),
-                                            4.0,
-                                        )
-                                        .on_hover_text("在系统文件管理器中定位该文件")
-                                        .clicked()
-                                        {
-                                            if let Some(parent) = self.selected_path.parent() {
-                                                open_in_file_manager(parent);
-                                            }
+                                        if let Some(parent) = self.selected_path.parent() {
+                                            open_in_file_manager(parent);
                                         }
                                     }
+                                }
 
-                                    if let Some(parent) = &parent_vault {
-                                        ui.add_space(4.0);
-                                        if icon_text_button(
-                                            ui,
-                                            true,
-                                            "📁",
-                                            &format!("所属保险箱: {}", parent.name),
-                                            egui::Color32::from_rgb(32, 45, 66),
-                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 80, 115)),
-                                            egui::Color32::from_rgb(180, 210, 255),
-                                            egui::vec2(0.0, 22.0),
-                                            4.0,
-                                        )
-                                        .on_hover_text("切换选中该文件所属的保险箱文件夹")
-                                        .clicked()
-                                        {
-                                            return_to_parent = Some((parent.path.clone(), parent.name.clone(), self.selected_index));
-                                        }
+                                if let Some(parent) = &parent_vault {
+                                    ui.add_space(4.0);
+                                    if icon_text_button(
+                                        ui,
+                                        true,
+                                        "📁",
+                                        &format!("所属保险箱: {}", parent.name),
+                                        egui::Color32::from_rgb(32, 45, 66),
+                                        egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 80, 115)),
+                                        egui::Color32::from_rgb(180, 210, 255),
+                                        egui::vec2(0.0, 22.0),
+                                        4.0,
+                                    )
+                                    .on_hover_text("切换选中该文件所属的保险箱文件夹")
+                                    .clicked()
+                                    {
+                                        return_to_parent = Some((parent.path.clone(), parent.name.clone(), self.selected_index));
                                     }
-                                },
-                            );
-                        });
+                                }
+                            },
+                        );
                     });
                 });
 
@@ -2441,23 +2625,14 @@ impl SecureVaultApp {
                             egui::vec2(ui.available_width(), 24.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
-                                ui.label(egui::RichText::new("🔒").size(14.0));
-                                ui.add_space(4.0);
                                 ui.label(
-                                    egui::RichText::new("该文件为密文存储块，属于受保护保险箱【")
-                                        .size(13.0)
-                                        .color(egui::Color32::from_rgb(215, 230, 255)),
-                                );
-                                ui.label(
-                                    egui::RichText::new(parent_name)
-                                        .size(13.0)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(52, 211, 153)),
-                                );
-                                ui.label(
-                                    egui::RichText::new("】。")
-                                        .size(13.0)
-                                        .color(egui::Color32::from_rgb(215, 230, 255)),
+                                    egui::RichText::new(format!(
+                                        "🔒  该文件为密文存储块，属于受保护保险箱【{}】。",
+                                        parent_name
+                                    ))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(52, 211, 153)),
                                 );
                             },
                         );
@@ -2521,23 +2696,14 @@ impl SecureVaultApp {
                             egui::vec2(ui.available_width(), 24.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
-                                ui.label(egui::RichText::new("📄").size(14.0));
-                                ui.add_space(4.0);
                                 ui.label(
-                                    egui::RichText::new("该文件当前处于明文状态，位于受保护文件夹【")
-                                        .size(13.0)
-                                        .color(egui::Color32::from_rgb(215, 230, 255)),
-                                );
-                                ui.label(
-                                    egui::RichText::new(parent_name)
-                                        .size(13.0)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(255, 235, 170)),
-                                );
-                                ui.label(
-                                    egui::RichText::new("】中。")
-                                        .size(13.0)
-                                        .color(egui::Color32::from_rgb(215, 230, 255)),
+                                    egui::RichText::new(format!(
+                                        "📄  该文件当前处于明文状态，位于受保护文件夹【{}】中。",
+                                        parent_name
+                                    ))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(255, 235, 170)),
                                 );
                             },
                         );
@@ -2554,6 +2720,13 @@ impl SecureVaultApp {
                         ui.add_space(14.0);
                         ui.separator();
                         ui.add_space(12.0);
+
+                        if let Some(parent) = &parent_vault {
+                            if vault::is_locked(&parent.path) {
+                                self.ui_append_panel(ui, &parent.path);
+                                return;
+                            }
+                        }
 
                         ui.label(
                             egui::RichText::new(format!(
@@ -2650,8 +2823,8 @@ impl SecureVaultApp {
             });
         }
 
-        if let Some((msg, is_err)) = &self.status_message {
-            status_banner(ui, msg, *is_err);
+        if self.status_message.is_some() {
+            status_banner(ui, &mut self.status_message);
         }
 
         if let Some((target_path, target_name, parent_idx)) = return_to_parent {
@@ -2683,10 +2856,8 @@ impl SecureVaultApp {
                     egui::vec2(ui.available_width(), 24.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        ui.label(egui::RichText::new("⚠️").size(15.0));
-                        ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new("检测到以下文件夹目前处于【已解密 / 明文】状态：")
+                            egui::RichText::new("⚠️  检测到以下文件夹目前处于【已解密 / 明文】状态：")
                                 .color(egui::Color32::from_rgb(255, 235, 170))
                                 .strong()
                                 .size(13.5),
@@ -2702,10 +2873,18 @@ impl SecureVaultApp {
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         for p in &unlocked {
-                            ui.horizontal(|ui| {
-                                ui.colored_label(egui::Color32::from_rgb(255, 220, 130), "🔓");
-                                ui.label(egui::RichText::new(p.to_string_lossy()).monospace().size(11.0).color(egui::Color32::from_rgb(200, 215, 235)));
-                            });
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 18.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("🔓  {}", p.to_string_lossy()))
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(200, 215, 235)),
+                                    );
+                                },
+                            );
                         }
                     });
 
@@ -2775,15 +2954,21 @@ impl SecureVaultApp {
                         ("❌", egui::Color32::from_rgb(239, 68, 68))
                     };
                     let clean_text = err.trim_start_matches('✅').trim_start_matches('❌').trim();
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 20.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.label(egui::RichText::new(icon).size(12.0));
-                            ui.add_space(3.0);
-                            ui.label(egui::RichText::new(clean_text).size(12.0).color(color));
-                        },
-                    );
+                    egui::Frame::default()
+                        .fill(if is_ok { egui::Color32::from_rgb(12, 36, 24) } else { egui::Color32::from_rgb(42, 16, 20) })
+                        .stroke(egui::Stroke::new(1.0, if is_ok { egui::Color32::from_rgb(16, 185, 129) } else { egui::Color32::from_rgb(239, 68, 68) }))
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            let label = egui::Label::new(
+                                egui::RichText::new(format!("{}  {}", icon, clean_text))
+                                    .size(12.0)
+                                    .color(color),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Wrap)
+                            .selectable(true);
+                            ui.add(label);
+                        });
                 }
 
                 ui.add_space(14.0);
@@ -2876,6 +3061,55 @@ impl SecureVaultApp {
 // ── Background Tasks ──
 
 impl SecureVaultApp {
+    fn ui_append_panel(&mut self, ui: &mut egui::Ui, path: &Path) {
+        ui.label(egui::RichText::new("继续加密新增文件").size(14.0).strong());
+        ui.add_space(6.0);
+        ui.label("将新文件放入此文件夹后，输入原密码继续加密。已有密文保持不变，无需先解密。");
+        ui.label(egui::RichText::new("新增文件在点击并成功完成前仍是明文，请勿在操作期间改动文件或目录。")
+            .color(egui::Color32::from_rgb(255, 235, 170)));
+        ui.label("如果新文件与已有加密文件的相对路径冲突，本次操作会停止，请先重命名或移走冲突的新文件。");
+        ui.add_space(10.0);
+        egui::Grid::new("append_grid").num_columns(2).spacing([12.0, 12.0]).show(ui, |ui| {
+            ui.label(egui::RichText::new("输入原密码:").size(13.0));
+            ui.add_enabled(!self.is_busy, bordered_text_edit(&mut self.password, !self.show_password, 260.0));
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        ui.add_enabled(!self.is_busy, egui::Checkbox::new(&mut self.show_password, "显示明文密码"));
+        ui.add_space(14.0);
+        if primary_action_button(ui, !self.is_busy, "🔒", "继续加密", egui::Color32::from_rgb(16, 149, 90)).clicked() {
+            if self.password.is_empty() {
+                self.status_message = Some(("请输入此文件夹的原密码".into(), true));
+            } else {
+                self.start_append_task(path);
+            }
+        }
+    }
+
+    fn start_append_task(&mut self, path: &Path) {
+        use zeroize::{Zeroize, Zeroizing};
+
+        let path = path.to_path_buf();
+        let password = Zeroizing::new(std::mem::take(&mut self.password));
+        self.confirm_password.zeroize();
+        self.show_password = false;
+        let tx = self.tx.clone();
+        self.is_busy = true;
+        self.progress_text = "正在验证原密码并加密新增文件...".into();
+        self.status_message = None;
+
+        thread::spawn(move || {
+            let result = vault::append(&path, &password);
+            drop(password);
+            let message = match result {
+                Ok(0) => VaultTaskMsg::Success("未新增文件；空目录已同步，已有密文保持不变。".into()),
+                Ok(count) => VaultTaskMsg::Success(format!("✅ 已继续加密 {} 个新增文件，已有密文保持不变。", count)),
+                Err(error) => VaultTaskMsg::Error(format!("{:#}", error)),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
     fn start_lock_task(&mut self, path: &Path) {
         let path = path.to_path_buf();
         // Immediately clear input fields upon clicking lock
@@ -2965,6 +3199,28 @@ impl SecureVaultApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_font_galley() {
+        let ctx = egui::Context::default();
+        setup_chinese_fonts(&ctx);
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 600.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut status = Some((
+                    "失败: Cannot lock folder: file 'C:\\Users\\rock\\workspace\\gemini\\sms-pod-apply\\.git\\objects\\01\\615b2375f11f04803db64effcbfcb40af61863' cannot be opened for writing (possibly in use by another program): 拒绝访问。 (os error 5)".into(),
+                    true
+                ));
+                status_banner(ui, &mut status);
+                assert!(status.is_some());
+            });
+        });
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn test_load_system_font() {

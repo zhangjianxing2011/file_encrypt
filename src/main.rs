@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 mod crypto;
 mod gui;
@@ -41,6 +42,11 @@ enum Commands {
         /// Optional password passed via flag (e.g. for automation/testing)
         #[arg(short, long)]
         password: Option<String>,
+    },
+    /// Encrypt newly added files in a locked folder using its existing password
+    Append {
+        /// Path to the locked folder
+        path: PathBuf,
     },
     /// Check whether a folder is locked
     Status {
@@ -85,6 +91,18 @@ fn main() -> Result<()> {
                 None => prompt_password("Enter password: ")?,
             };
             vault::unlock(&path, &pwd)?;
+        }
+        Some(Commands::Append { path }) => {
+            let password = Zeroizing::new(rpassword::prompt_password("Enter existing password: ")?);
+            if password.is_empty() {
+                anyhow::bail!("Password cannot be empty");
+            }
+            let added = vault::append(&path, &password)?;
+            if added == 0 {
+                println!("No new files; empty directories synchronized. Existing encrypted files are unchanged.");
+            } else {
+                println!("Encrypted {} new file(s). Existing encrypted files are unchanged.", added);
+            }
         }
         Some(Commands::Status { path }) => {
             if vault::is_locked(&path) {
@@ -155,4 +173,22 @@ fn prompt_new_password() -> Result<String> {
     }
 
     Ok(password)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn append_accepts_a_folder_path() {
+        let cli = Cli::try_parse_from(["securevault", "append", "folder with spaces"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Append { path }) if path == PathBuf::from("folder with spaces")));
+    }
+
+    #[test]
+    fn append_requires_a_path_and_rejects_password_flags() {
+        assert!(Cli::try_parse_from(["securevault", "append"]).is_err());
+        assert!(Cli::try_parse_from(["securevault", "append", "folder", "-p", "secret"]).is_err());
+        assert!(Cli::try_parse_from(["securevault", "append", "folder", "--password", "secret"]).is_err());
+    }
 }
