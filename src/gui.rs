@@ -1,5 +1,5 @@
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -56,6 +56,7 @@ pub struct SecureVaultApp {
     selected_name: String,
     selected_is_dir: bool,
     inspection: Option<VaultInspection>,
+    inspection_cache: HashMap<PathBuf, VaultInspection>,
     expanded_folders: HashSet<PathBuf>, // Fold/collapse state for all folders (vaults, subfolders, .vault_data)
 
     // Active Tab in right panel
@@ -851,6 +852,16 @@ impl SecureVaultApp {
             None
         };
 
+        let mut inspection_cache = HashMap::new();
+        if let Some(insp) = &inspection {
+            inspection_cache.insert(selected_path.clone(), insp.clone());
+        }
+        for v in &tracked_vaults {
+            if v.path != selected_path && v.path.exists() {
+                inspection_cache.insert(v.path.clone(), inspect_vault(&v.path));
+            }
+        }
+
         let mut expanded_folders = HashSet::new();
         for v in &tracked_vaults {
             expanded_folders.insert(v.path.clone());
@@ -863,6 +874,7 @@ impl SecureVaultApp {
             selected_name,
             selected_is_dir,
             inspection,
+            inspection_cache,
             expanded_folders,
             active_tab,
             password: String::new(),
@@ -925,15 +937,28 @@ impl SecureVaultApp {
 
     fn refresh_current_inspection(&mut self) {
         if self.selected_is_dir && self.selected_path.exists() {
-            self.inspection = Some(inspect_vault(&self.selected_path));
+            let insp = inspect_vault(&self.selected_path);
+            self.inspection_cache.insert(self.selected_path.clone(), insp.clone());
+            self.inspection = Some(insp);
         } else if !self.selected_is_dir && self.selected_path.exists() {
             if let Some(parent) = self.selected_path.parent() {
-                self.inspection = Some(inspect_vault(parent));
+                let insp = inspect_vault(parent);
+                self.inspection_cache.insert(parent.to_path_buf(), insp.clone());
+                self.inspection = Some(insp);
             } else {
                 self.inspection = None;
             }
         } else {
             self.inspection = None;
+        }
+    }
+
+    fn refresh_all_inspections(&mut self) {
+        self.refresh_current_inspection();
+        for v in &self.tracked_vaults {
+            if v.path.exists() {
+                self.inspection_cache.insert(v.path.clone(), inspect_vault(&v.path));
+            }
         }
     }
 
@@ -985,7 +1010,7 @@ impl eframe::App for SecureVaultApp {
                     self.status_message = Some((txt, false));
                     self.password.clear();
                     self.confirm_password.clear();
-                    self.refresh_current_inspection();
+                    self.refresh_all_inspections();
                     if self.selected_is_dir && self.selected_path.exists() {
                         if vault::is_locked(&self.selected_path) {
                             self.active_tab = ActiveTab::Unlock;
@@ -1000,7 +1025,7 @@ impl eframe::App for SecureVaultApp {
                     self.status_message = Some((format!("失败: {}", err), true));
                     self.password.clear();
                     self.confirm_password.clear();
-                    self.refresh_current_inspection();
+                    self.refresh_all_inspections();
                 }
                 VaultTaskMsg::ExitEncryptComplete(result) => {
                     self.is_exit_encrypting = false;
@@ -1180,7 +1205,7 @@ impl SecureVaultApp {
                         if refresh_resp.hovered() { egui::Color32::WHITE } else { egui::Color32::from_rgb(175, 190, 215) },
                     );
                     if refresh_resp.on_hover_text("刷新所有状态与文件清单").clicked() {
-                        self.refresh_current_inspection();
+                        self.refresh_all_inspections();
                     }
 
                     // Quick toggle all expanded / collapsed
@@ -1405,8 +1430,14 @@ impl SecureVaultApp {
                                 ui.add_space(2.0);
                                 let insp = if is_exact_selected {
                                     self.inspection.clone()
+                                } else if let Some(cached) = self.inspection_cache.get(&vault_item.path) {
+                                    Some(cached.clone())
+                                } else if !self.is_busy {
+                                    let fresh = inspect_vault(&vault_item.path);
+                                    self.inspection_cache.insert(vault_item.path.clone(), fresh.clone());
+                                    Some(fresh)
                                 } else {
-                                    Some(inspect_vault(&vault_item.path))
+                                    None
                                 };
 
                                 if let Some(insp) = insp {
@@ -1729,6 +1760,7 @@ impl SecureVaultApp {
                         .clicked()
                         {
                             if let Some(pos) = self.tracked_vaults.iter().position(|v| v.path == vault.path) {
+                                self.inspection_cache.remove(&vault.path);
                                 self.tracked_vaults.remove(pos);
                                 save_tracked_vaults(&self.tracked_vaults);
                                 if self.tracked_vaults.is_empty() {

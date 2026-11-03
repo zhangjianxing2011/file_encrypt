@@ -58,6 +58,9 @@ pub struct FileEntry {
     /// Windows readonly flag. None on Unix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readonly: Option<bool>,
+    /// SHA-256 hex digest of original plaintext for whole-file end-to-end authentication
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// A directory entry for preserving empty directories and permissions.

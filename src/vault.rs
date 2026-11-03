@@ -1,4 +1,4 @@
-use crate::crypto::{CryptoEngine, DEFAULT_CHUNK_SIZE};
+use crate::crypto::{CryptoEngine, FileDigest, DEFAULT_CHUNK_SIZE};
 use crate::index::*;
 use anyhow::{bail, ensure, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -6,19 +6,42 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::SystemTime;
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+// ─── Concurrency Budget Helpers ─────────────────────────────────────
+
+fn get_crypto_thread_pool() -> Result<rayon::ThreadPool> {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let max_threads = cores.clamp(2, 8);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(max_threads)
+        .thread_name(|i| format!("sv-worker-{}", i))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build crypto thread pool: {}", e))
+}
+
+fn get_cleanup_thread_pool() -> Result<rayon::ThreadPool> {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let max_threads = cores.clamp(2, 4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(max_threads)
+        .thread_name(|i| format!("sv-cleanup-{}", i))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build cleanup thread pool: {}", e))
+}
 
 // ─── Public API ─────────────────────────────────────────────────────
 
 /// Encrypt and lock a folder in-place.
 ///
 /// 1. Scans all files and directories
-/// 2. Encrypts each file → .vault_data/{uuid}.enc  (originals untouched)
-/// 3. Writes encrypted index → .vault_meta
-/// 4. Deletes original files and empty directories
+/// 2. Pre-checks write access on files to avoid partial failures
+/// 3. Encrypts each file → .vault_data/{uuid}.enc with lock-free collection
+/// 4. Writes encrypted index → .vault_meta
+/// 5. Safely overwrites and deletes original files with bounded concurrency
+/// 6. Reuses scanned directory structure to eliminate duplicate filesystem walks
 pub fn lock(folder: &Path, password: &str) -> Result<()> {
     let folder = dunce_canonicalize(folder)?;
 
@@ -60,31 +83,56 @@ pub fn lock(folder: &Path, password: &str) -> Result<()> {
     }
     fs::create_dir_all(&vault_data)?;
 
-    // ── 4. Encrypt files in parallel ────────────────────────────
-    let pb = make_progress_bar(files.len() as u64, "Encrypting", "cyan");
-    let entries: Mutex<Vec<FileEntry>> = Mutex::new(Vec::with_capacity(files.len()));
-    let errors: Mutex<Vec<(PathBuf, anyhow::Error)>> = Mutex::new(Vec::new());
-
-    files.par_iter().for_each(|file_path| {
-        let id = Uuid::new_v4().to_string();
-        let enc_path = vault_data.join(format!("{}.enc", id));
-
-        match crypto.encrypt_file(file_path, &enc_path) {
-            Ok(()) => {
-                if let Ok(entry) = build_file_entry(&id, file_path, &folder) {
-                    entries.lock().unwrap().push(entry);
-                }
-            }
-            Err(e) => {
-                errors.lock().unwrap().push((file_path.clone(), e));
-            }
+    // Pre-check: Ensure all files can be opened for writing before proceeding
+    for file_path in &files {
+        if let Err(e) = fs::OpenOptions::new().write(true).open(file_path) {
+            let _ = fs::remove_dir_all(&vault_data);
+            bail!(
+                "Cannot lock folder: file '{}' cannot be opened for writing (possibly in use by another program): {}. Aborted before modifying any files.",
+                file_path.display(),
+                e
+            );
         }
-        pb.inc(1);
+    }
+
+    // ── 4. Encrypt files in parallel (Lock-free collection & bounded pool) ───
+    let pb = make_progress_bar(files.len() as u64, "Encrypting", "cyan");
+    let crypto_pool = get_crypto_thread_pool()?;
+
+    let results: Vec<Result<FileEntry, (PathBuf, anyhow::Error)>> = crypto_pool.install(|| {
+        files
+            .par_iter()
+            .map(|file_path| {
+                let id = Uuid::new_v4().to_string();
+                let enc_path = vault_data.join(format!("{}.enc", id));
+
+                let res = match crypto.encrypt_file(file_path, &enc_path) {
+                    Ok(digest) => {
+                        match build_file_entry(&id, file_path, &folder, Some(digest)) {
+                            Ok(entry) => Ok(entry),
+                            Err(e) => Err((file_path.clone(), e)),
+                        }
+                    }
+                    Err(e) => Err((file_path.clone(), e)),
+                };
+                pb.inc(1);
+                res
+            })
+            .collect()
     });
     pb.finish_with_message("done");
 
+    // Partition results without lock contention
+    let mut file_entries = Vec::with_capacity(results.len());
+    let mut errors = Vec::new();
+    for res in results {
+        match res {
+            Ok(entry) => file_entries.push(entry),
+            Err(err) => errors.push(err),
+        }
+    }
+
     // Check for encryption errors — abort if any
-    let errors = errors.into_inner().unwrap();
     if !errors.is_empty() {
         let _ = fs::remove_dir_all(&vault_data);
         for (path, err) in &errors {
@@ -94,7 +142,6 @@ pub fn lock(folder: &Path, password: &str) -> Result<()> {
     }
 
     // ── 5. Build and encrypt index ──────────────────────────────
-    let file_entries = entries.into_inner().unwrap();
     let dir_entries = build_dir_entries(&folder, &dirs)?;
 
     let index = VaultIndex {
@@ -118,24 +165,51 @@ pub fn lock(folder: &Path, password: &str) -> Result<()> {
     // Automatic disaster recovery backup inside .vault_data/
     let _ = fs::write(vault_data.join(VAULT_META_BACKUP_FILE), &meta_json);
 
-    // ── 7. Delete originals ─────────────────────────────────────
+    // ── 7. Delete originals with bounded concurrency & error collection ───────
     let pb = make_progress_bar(files.len() as u64, "Cleaning up", "red");
-    for file_path in &files {
-        if let Err(e) = secure_delete(file_path) {
-            eprintln!("  ⚠️  Could not delete {}: {}", file_path.display(), e);
-        }
-        pb.inc(1);
-    }
+    let cleanup_pool = get_cleanup_thread_pool()?;
+
+    let cleanup_results: Vec<Result<(), (PathBuf, anyhow::Error)>> = cleanup_pool.install(|| {
+        files
+            .par_iter()
+            .map(|file_path| {
+                let res = secure_delete(file_path).map_err(|e| (file_path.clone(), e));
+                pb.inc(1);
+                res
+            })
+            .collect()
+    });
     pb.finish_with_message("done");
 
-    // Remove emptied directories (deepest first)
-    remove_empty_dirs(&folder)?;
+    let cleanup_errors: Vec<_> = cleanup_results
+        .into_iter()
+        .filter_map(|r| r.err())
+        .collect();
+
+    // Remove emptied directories (deepest first), reusing scanned `dirs` without re-walking filesystem!
+    let mut sorted_dirs = dirs.clone();
+    sorted_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+    for dir in &sorted_dirs {
+        let _ = fs::remove_dir(dir);
+    }
 
     // Hide vault files on Windows
     #[cfg(windows)]
     {
         let _ = set_hidden_attribute(&vault_data);
         let _ = set_hidden_attribute(&folder.join(VAULT_META_FILE));
+    }
+
+    // If any cleanup failed, DO NOT falsely claim success!
+    if !cleanup_errors.is_empty() {
+        for (path, err) in &cleanup_errors {
+            eprintln!("  ❌ Could not securely delete {}: {}", path.display(), err);
+        }
+        bail!(
+            "Vault encrypted, but {} original file(s) could not be securely deleted (file in use or permission denied). Originals remain on disk: {:?}",
+            cleanup_errors.len(),
+            cleanup_errors.iter().map(|(p, _)| p.display().to_string()).collect::<Vec<_>>()
+        );
     }
 
     let total_size: u64 = index.files.iter().map(|f| f.size).sum();
@@ -150,10 +224,11 @@ pub fn lock(folder: &Path, password: &str) -> Result<()> {
 /// Decrypt and unlock a locked folder.
 ///
 /// 1. Reads .vault_meta and verifies password
-/// 2. Decrypts index to learn original file paths
+/// 2. Decrypts index to learn original file paths and authentication digests
 /// 3. Recreates directory structure
-/// 4. Decrypts each file back to its original location
-/// 5. Removes .vault_data and .vault_meta
+/// 4. Decrypts each file back to original location with in-place buffer reuse and end-to-end authentication
+/// 5. Automatically rolls back any restored plaintext if decryption fails, preventing plaintext leakage
+/// 6. Removes .vault_data and .vault_meta upon successful completion
 pub fn unlock(folder: &Path, password: &str) -> Result<()> {
     let folder = dunce_canonicalize(folder)?;
 
@@ -195,9 +270,13 @@ pub fn unlock(folder: &Path, password: &str) -> Result<()> {
     let mut sorted_dirs = index.dirs.clone();
     sorted_dirs.sort_by_key(|d| d.path.matches('/').count());
 
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
     for dir in &sorted_dirs {
         let dir_path = folder.join(&dir.path);
-        fs::create_dir_all(&dir_path)?;
+        if !dir_path.exists() {
+            fs::create_dir_all(&dir_path)?;
+            created_dirs.push(dir_path.clone());
+        }
 
         #[cfg(unix)]
         if let Some(mode) = dir.unix_mode {
@@ -206,40 +285,72 @@ pub fn unlock(folder: &Path, password: &str) -> Result<()> {
         }
     }
 
-    // ── 5. Decrypt files in parallel ────────────────────────────
+    // ── 5. Decrypt files in parallel with rollback protection ───
     let vault_data = folder.join(VAULT_DATA_DIR);
     let pb = make_progress_bar(index.files.len() as u64, "Decrypting", "green");
-    let errors: Mutex<Vec<(String, anyhow::Error)>> = Mutex::new(Vec::new());
+    let crypto_pool = get_crypto_thread_pool()?;
 
-    index.files.par_iter().for_each(|entry| {
-        let enc_path = vault_data.join(format!("{}.enc", entry.id));
-        let dst_path = folder.join(&entry.path);
+    let results: Vec<Result<PathBuf, (String, anyhow::Error)>> = crypto_pool.install(|| {
+        index
+            .files
+            .par_iter()
+            .map(|entry| {
+                let enc_path = vault_data.join(format!("{}.enc", entry.id));
+                let dst_path = folder.join(&entry.path);
 
-        // Ensure parent dir exists
-        if let Some(parent) = dst_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
+                // Only create parent directory if not already existing
+                if let Some(parent) = dst_path.parent() {
+                    if !parent.exists() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                }
 
-        match crypto.decrypt_file(&enc_path, &dst_path) {
-            Ok(()) => {
-                restore_file_metadata(&dst_path, entry);
-            }
-            Err(e) => {
-                errors.lock().unwrap().push((entry.path.clone(), e));
-            }
-        }
-        pb.inc(1);
+                // Authenticated decryption with expected size & SHA-256
+                let res = match crypto.decrypt_file_authenticated(
+                    &enc_path,
+                    &dst_path,
+                    Some(entry.size),
+                    entry.sha256.as_deref(),
+                ) {
+                    Ok(_) => {
+                        restore_file_metadata(&dst_path, entry);
+                        Ok(dst_path)
+                    }
+                    Err(e) => Err((entry.path.clone(), e)),
+                };
+                pb.inc(1);
+                res
+            })
+            .collect()
     });
     pb.finish_with_message("done");
 
-    // Check for errors
-    let errors = errors.into_inner().unwrap();
+    let mut restored_files = Vec::new();
+    let mut errors = Vec::new();
+    for r in results {
+        match r {
+            Ok(p) => restored_files.push(p),
+            Err(e) => errors.push(e),
+        }
+    }
+
+    // Check for errors — if any failed, ROLL BACK all restored files & dirs to prevent plaintext leakage!
     if !errors.is_empty() {
+        println!("⚠️  Decryption failed for {} file(s) — rolling back to prevent plaintext leakage...", errors.len());
+        for file_path in &restored_files {
+            let _ = secure_delete(file_path);
+        }
+        // Rollback newly created directories (deepest first)
+        created_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        for dir_path in &created_dirs {
+            let _ = fs::remove_dir(dir_path);
+        }
+
         for (path, err) in &errors {
             eprintln!("  ❌ {}: {}", path, err);
         }
         bail!(
-            "Decryption failed for {} file(s). Encrypted data preserved — you can retry.",
+            "Decryption failed for {} file(s). Partially restored files were cleaned up to prevent plaintext leakage. Encrypted vault is preserved — you can safely retry.",
             errors.len()
         );
     }
@@ -317,7 +428,7 @@ fn scan_folder(folder: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
 
 // ─── Index Building ─────────────────────────────────────────────────
 
-fn build_file_entry(id: &str, path: &Path, base: &Path) -> Result<FileEntry> {
+fn build_file_entry(id: &str, path: &Path, base: &Path, digest: Option<FileDigest>) -> Result<FileEntry> {
     let relative = path
         .strip_prefix(base)
         .unwrap_or(path)
@@ -326,15 +437,20 @@ fn build_file_entry(id: &str, path: &Path, base: &Path) -> Result<FileEntry> {
 
     let metadata = fs::metadata(path)?;
     let (modified_secs, modified_nanos) = file_mtime(&metadata);
+    let (size, sha256) = match digest {
+        Some(d) => (d.size, Some(d.sha256_hex())),
+        None => (metadata.len(), None),
+    };
 
     Ok(FileEntry {
         id: id.to_string(),
         path: relative,
-        size: metadata.len(),
+        size,
         modified_secs,
         modified_nanos,
         unix_mode: get_unix_mode(&metadata),
         readonly: get_readonly(&metadata),
+        sha256,
     })
 }
 
@@ -414,9 +530,13 @@ fn get_readonly(_metadata: &fs::Metadata) -> Option<bool> {
 
 // ─── Secure Deletion ────────────────────────────────────────────────
 
-/// Overwrite a file with zeros before unlinking. This mitigates casual
-/// recovery from HDD; on SSD the OS/firmware may still retain data due
+const SECURE_DELETE_BUF_SIZE: usize = 256 * 1024; // 256 KiB
+static ZERO_BUF: [u8; SECURE_DELETE_BUF_SIZE] = [0u8; SECURE_DELETE_BUF_SIZE];
+
+/// Overwrite a file with zeros before unlinking using a reusable 256 KiB buffer.
+/// This mitigates casual recovery from HDD; on SSD the OS/firmware may still retain data due
 /// to wear-leveling, but this is the best user-space mitigation.
+/// Includes fsync (sync_all) to ensure data is physically written to disk.
 fn secure_delete(path: &Path) -> Result<()> {
     // Make file writable first (needed on Windows for readonly files)
     if let Ok(md) = fs::metadata(path) {
@@ -432,53 +552,16 @@ fn secure_delete(path: &Path) -> Result<()> {
     if len > 0 {
         use std::io::Write;
         let mut file = fs::OpenOptions::new().write(true).open(path)?;
-        let zeros = vec![0u8; 8192];
         let mut remaining = len;
         while remaining > 0 {
-            let n = remaining.min(8192) as usize;
-            file.write_all(&zeros[..n])?;
+            let n = remaining.min(SECURE_DELETE_BUF_SIZE as u64) as usize;
+            file.write_all(&ZERO_BUF[..n])?;
             remaining -= n as u64;
         }
         file.sync_all()?;
     }
 
     fs::remove_file(path)?;
-    Ok(())
-}
-
-/// Remove empty directories under `folder`, deepest first.
-fn remove_empty_dirs(folder: &Path) -> Result<()> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-
-    for entry in WalkDir::new(folder)
-        .min_depth(1)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            name != VAULT_DATA_DIR && name != VAULT_META_FILE
-        })
-    {
-        if let Ok(entry) = entry {
-            if entry.file_type().is_dir() {
-                dirs.push(entry.into_path());
-            }
-        }
-    }
-
-    // Sort deepest first
-    dirs.sort_by(|a, b| {
-        b.components()
-            .count()
-            .cmp(&a.components().count())
-    });
-
-    for dir in dirs {
-        // Only remove if truly empty
-        if dir.read_dir().map(|mut d| d.next().is_none()).unwrap_or(false) {
-            let _ = fs::remove_dir(&dir);
-        }
-    }
-
     Ok(())
 }
 
@@ -675,5 +758,47 @@ mod tests {
         assert_eq!(format_size(1536), "1.50 KB");
         assert_eq!(format_size(1048576), "1.00 MB");
         assert_eq!(format_size(1073741824), "1.00 GB");
+    }
+
+    #[test]
+    fn test_unlock_partial_failure_rollback() {
+        let dir = setup_test_folder("rollback");
+        create_test_file(&dir, "good1.txt", b"Good file 1");
+        create_test_file(&dir, "good2.txt", b"Good file 2");
+        create_test_file(&dir, "corrupt.txt", b"Corrupted content target");
+
+        let password = "my-secure-password-123";
+        lock(&dir, password).unwrap();
+
+        // Corrupt one encrypted blob in .vault_data
+        let vault_data = dir.join(VAULT_DATA_DIR);
+        let mut enc_files: Vec<_> = fs::read_dir(&vault_data)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("enc"))
+            .collect();
+        assert!(!enc_files.is_empty());
+        let target_file = enc_files.pop().unwrap();
+        // Tamper with the encrypted file
+        let mut bytes = fs::read(&target_file).unwrap();
+        let idx = bytes.len() - 1;
+        bytes[idx] ^= 0xFF;
+        fs::write(&target_file, &bytes).unwrap();
+
+        // Unlock must fail
+        let res = unlock(&dir, password);
+        assert!(res.is_err());
+
+        // Verify rollback: NO plaintext files should be left exposed in dir!
+        assert!(!dir.join("good1.txt").exists(), "Rolled back good1.txt");
+        assert!(!dir.join("good2.txt").exists(), "Rolled back good2.txt");
+        assert!(!dir.join("corrupt.txt").exists(), "Rolled back corrupt.txt");
+
+        // Encrypted data remains intact
+        assert!(dir.join(VAULT_META_FILE).exists());
+        assert!(dir.join(VAULT_DATA_DIR).exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -7,7 +7,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use hmac::Hmac;
 use rand::RngCore;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -33,6 +33,24 @@ const HMAC_KEY_INFO: &[u8] = b"securevault-hmac-key-v1";
 const PASSWORD_CHECK_MSG: &[u8] = b"securevault-password-check-v1";
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Result of file encryption / decryption containing whole-file size and SHA-256 digest
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDigest {
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+impl FileDigest {
+    pub fn sha256_hex(&self) -> String {
+        let mut s = String::with_capacity(64);
+        for b in &self.sha256 {
+            use std::fmt::Write;
+            let _ = write!(s, "{:02x}", b);
+        }
+        s
+    }
+}
 
 // ─── CryptoEngine ───────────────────────────────────────────────────
 
@@ -130,7 +148,8 @@ impl CryptoEngine {
 
     // ─── Streaming file encryption ──────────────────────────────
 
-    /// Encrypt a file using streaming chunked AES-256-GCM.
+    /// Encrypt a file using streaming chunked AES-256-GCM with in-place buffer reuse.
+    /// Returns the original file size and SHA-256 digest for whole-file end-to-end authentication.
     ///
     /// Output format:
     /// ```text
@@ -138,9 +157,10 @@ impl CryptoEngine {
     /// For each chunk:
     ///   [4 bytes] payload_len (u32 LE)
     ///   [12 bytes] nonce
-    ///   [variable] ciphertext + GCM tag (16 bytes)
+    ///   [variable] ciphertext
+    ///   [16 bytes] GCM tag
     /// ```
-    pub fn encrypt_file(&self, src: &Path, dst: &Path) -> Result<()> {
+    pub fn encrypt_file(&self, src: &Path, dst: &Path) -> Result<FileDigest> {
         let src_file = File::open(src)
             .map_err(|e| anyhow!("Cannot open source file '{}': {}", src.display(), e))?;
         let mut reader = BufReader::with_capacity(self.chunk_size, src_file);
@@ -154,37 +174,67 @@ impl CryptoEngine {
         // Write chunk size header
         writer.write_all(&(self.chunk_size as u32).to_le_bytes())?;
 
+        // Pre-allocate a single reusable buffer to avoid reallocations in the chunk loop
         let mut buf = vec![0u8; self.chunk_size];
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        let mut hasher = Sha256::new();
+        let mut total_plain_bytes: u64 = 0;
 
-        loop {
-            let bytes_read = read_fill(&mut reader, &mut buf)?;
-            if bytes_read == 0 {
-                break;
+        let res: Result<()> = (|| {
+            loop {
+                let bytes_read = read_fill(&mut reader, &mut buf)?;
+                if bytes_read == 0 {
+                    break;
+                }
+
+                // Update SHA-256 with original plaintext chunk before in-place encryption
+                hasher.update(&buf[..bytes_read]);
+                total_plain_bytes += bytes_read as u64;
+
+                // Random nonce per chunk
+                rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+                let nonce = Nonce::from_slice(&nonce_bytes);
+
+                // In-place encryption: encrypts buf[..bytes_read] in-place and returns detached tag
+                let tag = cipher
+                    .encrypt_in_place_detached(nonce, b"", &mut buf[..bytes_read])
+                    .map_err(|_| anyhow!("Chunk encryption failed"))?;
+
+                // Write: payload_len + nonce + ciphertext + tag
+                let payload_len = (NONCE_LEN + bytes_read + TAG_LEN) as u32;
+                writer.write_all(&payload_len.to_le_bytes())?;
+                writer.write_all(&nonce_bytes)?;
+                writer.write_all(&buf[..bytes_read])?;
+                writer.write_all(tag.as_slice())?;
             }
 
-            // Random nonce per chunk
-            let mut nonce_bytes = [0u8; NONCE_LEN];
-            rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-            let nonce = Nonce::from_slice(&nonce_bytes);
+            writer.flush()?;
+            Ok(())
+        })();
 
-            // Encrypt this chunk
-            let ciphertext = cipher
-                .encrypt(nonce, &buf[..bytes_read])
-                .map_err(|_| anyhow!("Chunk encryption failed"))?;
-
-            // Write: payload_len + nonce + ciphertext(+tag)
-            let payload_len = (NONCE_LEN + ciphertext.len()) as u32;
-            writer.write_all(&payload_len.to_le_bytes())?;
-            writer.write_all(&nonce_bytes)?;
-            writer.write_all(&ciphertext)?;
+        if let Err(e) = res {
+            drop(writer);
+            let _ = std::fs::remove_file(dst);
+            return Err(e);
         }
 
-        writer.flush()?;
-        Ok(())
+        let sha256_bytes: [u8; 32] = hasher.finalize().into();
+        Ok(FileDigest {
+            size: total_plain_bytes,
+            sha256: sha256_bytes,
+        })
     }
 
-    /// Decrypt a file using streaming chunked AES-256-GCM.
-    pub fn decrypt_file(&self, src: &Path, dst: &Path) -> Result<()> {
+    /// Decrypt a file with in-place buffer reuse, validating against expected size and SHA-256.
+    /// If any error occurs or integrity verification fails, the destination file is immediately deleted
+    /// to prevent leaving behind corrupted or partial plaintext.
+    pub fn decrypt_file_authenticated(
+        &self,
+        src: &Path,
+        dst: &Path,
+        expected_size: Option<u64>,
+        expected_sha256_hex: Option<&str>,
+    ) -> Result<FileDigest> {
         let src_file = File::open(src)
             .map_err(|e| anyhow!("Cannot open encrypted file '{}': {}", src.display(), e))?;
         let mut reader = BufReader::new(src_file);
@@ -198,42 +248,102 @@ impl CryptoEngine {
         // Read chunk size header
         let mut header = [0u8; 4];
         reader.read_exact(&mut header)?;
-        let _chunk_size = u32::from_le_bytes(header);
+        let chunk_size = u32::from_le_bytes(header) as usize;
 
-        loop {
-            // Read payload length
-            let mut len_bytes = [0u8; 4];
-            match reader.read_exact(&mut len_bytes) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
+        // Pre-allocate reusable buffers for in-place decryption
+        let mut buf = vec![0u8; chunk_size];
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        let mut tag_bytes = [0u8; TAG_LEN];
+        let mut hasher = Sha256::new();
+        let mut total_plain_bytes: u64 = 0;
+
+        let res: Result<FileDigest> = (|| {
+            loop {
+                // Read payload length
+                let mut len_bytes = [0u8; 4];
+                match reader.read_exact(&mut len_bytes) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let payload_len = u32::from_le_bytes(len_bytes) as usize;
+
+                if payload_len < NONCE_LEN + TAG_LEN {
+                    anyhow::bail!("Corrupted encrypted chunk: payload too small");
+                }
+
+                // Read nonce
+                reader.read_exact(&mut nonce_bytes)?;
+                let nonce = Nonce::from_slice(&nonce_bytes);
+
+                // Read ciphertext (payload_len - NONCE_LEN - TAG_LEN)
+                let data_len = payload_len - NONCE_LEN - TAG_LEN;
+                if buf.len() < data_len {
+                    buf.resize(data_len, 0);
+                }
+                reader.read_exact(&mut buf[..data_len])?;
+
+                // Read 16-byte tag
+                reader.read_exact(&mut tag_bytes)?;
+                let tag = Tag::from_slice(&tag_bytes);
+
+                // In-place decryption directly in reusable buffer
+                cipher
+                    .decrypt_in_place_detached(nonce, b"", &mut buf[..data_len], tag)
+                    .map_err(|_| anyhow!("Decryption failed: data corrupted or wrong password"))?;
+
+                // Feed decrypted plaintext to SHA-256 for whole-file integrity authentication
+                hasher.update(&buf[..data_len]);
+                total_plain_bytes += data_len as u64;
+
+                writer.write_all(&buf[..data_len])?;
             }
-            let payload_len = u32::from_le_bytes(len_bytes) as usize;
 
-            if payload_len < NONCE_LEN + TAG_LEN {
-                anyhow::bail!("Corrupted encrypted chunk: payload too small");
+            // Whole-file size authentication
+            if let Some(exp_size) = expected_size {
+                if total_plain_bytes != exp_size {
+                    anyhow::bail!(
+                        "File integrity check failed: decrypted size mismatch (expected {} bytes, got {})",
+                        exp_size,
+                        total_plain_bytes
+                    );
+                }
             }
 
-            // Read nonce
-            let mut nonce_bytes = [0u8; NONCE_LEN];
-            reader.read_exact(&mut nonce_bytes)?;
-            let nonce = Nonce::from_slice(&nonce_bytes);
+            let sha256_bytes: [u8; 32] = hasher.finalize().into();
+            let digest = FileDigest {
+                size: total_plain_bytes,
+                sha256: sha256_bytes,
+            };
 
-            // Read ciphertext + tag
-            let ct_len = payload_len - NONCE_LEN;
-            let mut ciphertext = vec![0u8; ct_len];
-            reader.read_exact(&mut ciphertext)?;
+            // Whole-file SHA-256 authentication
+            if let Some(exp_sha256) = expected_sha256_hex {
+                let computed_hex = digest.sha256_hex();
+                if !computed_hex.eq_ignore_ascii_case(exp_sha256) {
+                    anyhow::bail!(
+                        "File integrity check failed: SHA-256 mismatch (tampered or truncated data)"
+                    );
+                }
+            }
 
-            // Decrypt
-            let plaintext = cipher
-                .decrypt(nonce, ciphertext.as_ref())
-                .map_err(|_| anyhow!("Decryption failed: data corrupted or wrong password"))?;
+            writer.flush()?;
+            Ok(digest)
+        })();
 
-            writer.write_all(&plaintext)?;
+        if let Err(e) = res {
+            // Drop writer to release file handle on Windows/macOS/Linux, then delete partial plaintext
+            drop(writer);
+            let _ = std::fs::remove_file(dst);
+            return Err(e);
         }
 
-        writer.flush()?;
-        Ok(())
+        res
+    }
+
+    /// Decrypt a file using streaming chunked AES-256-GCM.
+    #[allow(dead_code)]
+    pub fn decrypt_file(&self, src: &Path, dst: &Path) -> Result<FileDigest> {
+        self.decrypt_file_authenticated(src, dst, None, None)
     }
 }
 
@@ -358,7 +468,6 @@ mod tests {
         let result = fs::read(&dec).unwrap();
         assert_eq!(content, result.as_slice());
 
-        // Cleanup
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -411,6 +520,80 @@ mod tests {
         engine.decrypt_file(&enc, &dec).unwrap();
 
         assert_eq!(fs::read(&src).unwrap(), fs::read(&dec).unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_integrity_tamper_detection() {
+        let dir = std::env::temp_dir().join("securevault_test_tamper");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let src = dir.join("secret.txt");
+        let enc = dir.join("secret.enc");
+        let dec = dir.join("secret_out.txt");
+
+        fs::write(&src, b"Confidential information that must not be tampered with").unwrap();
+
+        let salt = CryptoEngine::generate_salt();
+        let engine = CryptoEngine::new(b"test-password-123", &salt, DEFAULT_CHUNK_SIZE).unwrap();
+
+        let digest = engine.encrypt_file(&src, &enc).unwrap();
+
+        // Tamper with a byte inside encrypted file (flip tag bits)
+        let mut enc_bytes = fs::read(&enc).unwrap();
+        let last_idx = enc_bytes.len() - 1;
+        enc_bytes[last_idx] ^= 0xFF;
+        fs::write(&enc, &enc_bytes).unwrap();
+
+        // Decryption must fail
+        let res = engine.decrypt_file_authenticated(
+            &enc,
+            &dec,
+            Some(digest.size),
+            Some(&digest.sha256_hex()),
+        );
+        assert!(res.is_err());
+        // Cleaned up! Corrupted plaintext must NOT remain on disk
+        assert!(!dec.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_truncation_detection() {
+        let dir = std::env::temp_dir().join("securevault_test_truncation");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let src = dir.join("large.bin");
+        let enc = dir.join("large.enc");
+        let dec = dir.join("large_out.bin");
+
+        // 3 chunks of 1KB
+        let data = vec![0x42u8; 3072];
+        fs::write(&src, &data).unwrap();
+
+        let salt = CryptoEngine::generate_salt();
+        let engine = CryptoEngine::new(b"test-password-123", &salt, 1024).unwrap();
+
+        let digest = engine.encrypt_file(&src, &enc).unwrap();
+
+        // Cut off half of the encrypted file to simulate truncation attack
+        let enc_bytes = fs::read(&enc).unwrap();
+        let truncated = &enc_bytes[..enc_bytes.len() / 2];
+        fs::write(&enc, truncated).unwrap();
+
+        let res = engine.decrypt_file_authenticated(
+            &enc,
+            &dec,
+            Some(digest.size),
+            Some(&digest.sha256_hex()),
+        );
+        assert!(res.is_err());
+        // Must be cleanly deleted so no truncated plaintext leaks
+        assert!(!dec.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
