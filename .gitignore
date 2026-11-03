@@ -1,0 +1,44 @@
+# Rust & Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Build & Release outputs
+*.exe
+*.dll
+*.so
+*.dylib
+*.app/
+*.dmg
+*.zip
+*.tar.gz
+*.iconset/
+dmg_staging/
+
+# macOS system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows system files
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# IDE & Editor configurations
+.idea/
+*.iml
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# Logs & Temporary files
+*.log
+*.tmp
+debug/
