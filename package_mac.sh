@@ -82,7 +82,7 @@ cat > "${CONTENTS}/Info.plist" <<EOF
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
-    <string>10.15</string>
+    <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>

@@ -56,18 +56,10 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-
     #[cfg(windows)]
-    if cli.command.is_some() && !matches!(cli.command, Some(Commands::Gui)) {
-        unsafe {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn AttachConsole(dwProcessId: u32) -> i32;
-            }
-            AttachConsole(0xFFFFFFFF);
-        }
-    }
+    init_console_if_needed();
+
+    let cli = Cli::parse();
 
     match cli.command {
         None | Some(Commands::Gui) => {
@@ -173,6 +165,84 @@ fn prompt_new_password() -> Result<String> {
     }
 
     Ok(password)
+}
+
+#[cfg(windows)]
+fn init_console_if_needed() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && !args.iter().any(|a| a == "gui") {
+        unsafe {
+            type HANDLE = *mut std::ffi::c_void;
+            type DWORD = u32;
+            type BOOL = i32;
+            type LPCWSTR = *const u16;
+
+            const ATTACH_PARENT_PROCESS: DWORD = 0xFFFFFFFF;
+            const STD_INPUT_HANDLE: DWORD = 0xFFFFFFF6;
+            const STD_OUTPUT_HANDLE: DWORD = 0xFFFFFFF5;
+            const STD_ERROR_HANDLE: DWORD = 0xFFFFFFF4;
+
+            const GENERIC_READ: DWORD = 0x80000000;
+            const GENERIC_WRITE: DWORD = 0x40000000;
+            const FILE_SHARE_READ: DWORD = 1;
+            const FILE_SHARE_WRITE: DWORD = 2;
+            const OPEN_EXISTING: DWORD = 3;
+            const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn AttachConsole(dwProcessId: DWORD) -> BOOL;
+                fn GetStdHandle(nStdHandle: DWORD) -> HANDLE;
+                fn SetStdHandle(nStdHandle: DWORD, hHandle: HANDLE) -> BOOL;
+                fn CreateFileW(
+                    lpFileName: LPCWSTR,
+                    dwDesiredAccess: DWORD,
+                    dwShareMode: DWORD,
+                    lpSecurityAttributes: *const std::ffi::c_void,
+                    dwCreationDisposition: DWORD,
+                    dwFlagsAndAttributes: DWORD,
+                    hTemplateFile: HANDLE,
+                ) -> HANDLE;
+            }
+
+            if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+                let current_out = GetStdHandle(STD_OUTPUT_HANDLE);
+                if current_out.is_null() || current_out == INVALID_HANDLE_VALUE {
+                    let conout: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+                    let h_out = CreateFileW(
+                        conout.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    );
+                    if h_out != INVALID_HANDLE_VALUE && !h_out.is_null() {
+                        SetStdHandle(STD_OUTPUT_HANDLE, h_out);
+                        SetStdHandle(STD_ERROR_HANDLE, h_out);
+                    }
+                }
+
+                let current_in = GetStdHandle(STD_INPUT_HANDLE);
+                if current_in.is_null() || current_in == INVALID_HANDLE_VALUE {
+                    let conin: Vec<u16> = "CONIN$\0".encode_utf16().collect();
+                    let h_in = CreateFileW(
+                        conin.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    );
+                    if h_in != INVALID_HANDLE_VALUE && !h_in.is_null() {
+                        SetStdHandle(STD_INPUT_HANDLE, h_in);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

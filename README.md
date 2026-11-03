@@ -8,7 +8,7 @@
 
 1. **完全免安装 / 绿色便携**：
    - **Windows**：单个 `.exe` 二进制文件，无注册表依赖，随拷随用。
-   - **macOS**：提供绿色免安装的 `SecureVault.app` 应用程序包及打包脚本，支持解压即用。
+   - **macOS**：提供绿色免安装的 `SecureVault.app` 应用程序包与 `.dmg` 拖拽镜像，支持解压即用。
 2. **左侧管理面板与文件展示**：
    - 左侧常驻受保护文件夹列表，自动持久化记录用户添加的保险箱。
    - **已加密状态**：展示 `.vault_data` 中的随机 UUID 密文数据块及加密大小，原始文件名和目录结构被强加密混淆，彻底防窥。
@@ -43,37 +43,41 @@
 
 ---
 
-## 免安装运行与打包说明
+## 操作系统版本支持说明 (Windows & macOS)
 
-### Windows 免安装使用
-1. 编译生成产物：`target\release\securevault.exe`。
-2. 该文件为单文件独立程序，无需运行任何安装器，双击即可直接打开图形界面，也可直接通过命令行调用。
+| 运行模式 | 最低支持的 Windows 版本 | 架构要求 | 关键限制与底层依赖说明 |
+| :--- | :--- | :--- | :--- |
+| **图形界面（UI / GUI）** | **Windows 10**（64位，1607+）<br>或 **Windows Server 2016** 及以上 | **64 位 (x64)** | 内置基于 `eframe` + `wgpu` 的现代图形栈，强制依赖 **DirectX 12**、现代 Vulkan 与 DXGI 1.4+。<br>❌ *Windows 7 / 8 / 8.1 / Server 2012 R2 因缺少 DirectX 12 驱动支持，无法运行 GUI 版本。* |
+| **集成发布包（CLI 命令行模式）**<br>*(即默认下载的 `SecureVault-Windows-x64.exe`)* | **Windows 10**（64位）<br>或 **Windows Server 2016** 及以上 | **64 位 (x64)** | 默认提供的绿色单文件同时内置了图形栈符号及 Rust 1.78+ 运行时库，系统环境基线与 UI 版一致。 |
+| **独立纯命令行构建（Pure CLI）**<br>*(按需剥离 GUI 依赖单独编译)* | **Windows Server 2012 R2**（64位）<br>或 **Windows 8.1**（64位） | **64 位 (x64)** | 剥离图形渲染栈后，Argon2id、AES-256-GCM 等加密逻辑可向下兼容至 Server 2012 R2；需系统安装 **Universal C Runtime (KB2999226)** 补丁。<br>❌ *Windows 7 原生缺失 `ProcessPrng`、`WaitOnAddress` 等基础安全与并发 API，不予支持。* |
 
-### macOS 安装镜像与免安装包
-macOS 支持一键打包为 `.dmg` 拖拽安装镜像及 `.app` 绿色免安装包：
-1. **一键生成 macOS 安装包与镜像**：
-   ```bash
-   chmod +x ./package_mac.sh
-   ./package_mac.sh
-   ```
-   执行后将自动生成：
-   - `SecureVault.dmg`：标准的 macOS 拖拽安装镜像（内置 `/Applications` 替身）。
-   - `SecureVault.app`：标准的 macOS 应用程序包目录。
-   - `SecureVault-macOS-portable.zip`：可直接发给其他用户的免安装绿色压缩包。
+> [!NOTE]
+> * **32 位支持**：不支持任何 32 位（x86）系统。
+> * **macOS 兼容性**：仅支持 **Apple Silicon 架构（搭载 M1 / M2 / M3 / M4 / M5 / M6 等 M 系列全系芯片）** 的 Mac 设备，最低系统版本要求 **macOS 11.0 (Big Sur)** 或更高版本（不提供 Intel x86_64 架构支持）。
 
-2. **macOS 隔离属性（Gatekeeper）处理**：
-   若未在苹果官方付费签名，从网络下载的 `.app` 会被 macOS 标记隔离。只需采用以下任一方式即可正常打开：
-   - **图形操作**：按住 `Control` 键（或右键）点击 `SecureVault.app`，选择【打开】，在弹出窗口中点击【打开】即可（仅需首次操作一次）。
-   - **终端命令**：运行 `xattr -cr /Applications/SecureVault.app`（或对应 app 路径）清除隔离属性。
+---
 
-### GitHub Actions 自动打包（CI/CD）
-项目已配置自动化构建工作流（`.github/workflows/build-and-release.yml`）：
-- **日常编译产物与最新构建**：向 `main` 分支提交代码或手动触发（`Actions -> Run workflow`），系统将自动完成 Windows（`.exe`）与 macOS（Universal 通用架构 `.dmg`）的打包，自动更新发布 `latest` 预发布版本，也可在该次运行的 **Artifacts** 区域直接下载。
-- **自动化正式发布 Release**：推送版本 Tag（如 `v0.1.0`）时，将自动创建正式 GitHub Release 并上传以下资产：
-  - `SecureVault-Windows-x64.exe`（Windows 64位单文件可执行程序）
-  - `SecureVault-Windows-x64.zip`（包含可执行程序及说明文档）
-  - `SecureVault-macOS.dmg`（macOS 通用架构安装镜像，同时支持 Apple Silicon M系列与 Intel Mac）
-  - `SecureVault-macOS-portable.zip`（macOS 免安装绿色便携包）
+## 快速开始（获取与运行）
+
+SecureVault 为**完全免安装的绿色便携软件**，不写注册表、不驻留后台服务，下载即可随拷随用。
+
+### Windows 用户使用方法
+1. **获取软件**：
+   * 下载单文件版 `SecureVault-Windows-x64.exe`，或下载并解压 `SecureVault-Windows-x64.zip`。
+2. **运行使用**：
+   * **图形界面**：直接双击 `SecureVault-Windows-x64.exe`（或重命名后的 `securevault.exe`）即可打开窗口。
+   * **命令行使用**：在软件所在目录空白处按住 `Shift + 鼠标右键`，选择【在此处打开 PowerShell 窗口】或【在终端中打开】，直接输入 `.\SecureVault-Windows-x64.exe <命令>`（亦可将程序放入系统的 PATH 环境变量目录中简写为 `securevault`）。
+
+### macOS 用户使用方法
+1. **获取软件**：
+   * 下载 `SecureVault.dmg` 镜像打开后拖入“应用程序”文件夹，或下载 `SecureVault-macOS-portable.zip` 免安装包解压到任意目录使用。
+2. **首次打开安全提示（Gatekeeper 隔离处理）**：
+   * 因本软件开源且未加入付费苹果开发者计划，macOS 首次运行未签名应用时可能会提示“无法验证开发者”或“已被隔离”。只需进行一次信任授权：
+     * **方式一（图形界面）**：按住键盘 `Control` 键同时用鼠标右键点击 `SecureVault.app`，在弹出菜单中点击【打开】，并在随后的安全确认弹窗中点击【打开】即可（仅需首次操作一次）。
+     * **方式二（终端命令）**：打开“终端”，执行以下命令移除系统的下载隔离标记：
+       ```bash
+       xattr -cr /Applications/SecureVault.app
+       ```
 
 ---
 
@@ -102,36 +106,89 @@ macOS 支持一键打包为 `.dmg` 拖拽安装镜像及 `.app` 绿色免安装�
 
 ## 命令行（CLI）指令速查
 
-- **启动 GUI**：
+在 Windows 控制台（CMD / PowerShell）中，可直接执行 `.\securevault.exe <命令>`（或加入系统环境变量后执行 `securevault <命令>`）。
+
+SecureVault 命令行默认采用**安全交互式密码输入**（输入时不显示字符，支持中文密码），**彻底避免密码残留在终端命令历史（CMD/PowerShell）、系统任务管理器进程列表或 Windows 安全审计事件日志（Event 4688 / Sysmon）中**。
+
+### 1. 常用命令清单
+
+| 命令格式 | 功能说明 | 密码输入机制 |
+| :--- | :--- | :--- |
+| `securevault gui` | 启动原生图形界面（无参数运行 `securevault` 默认亦启动 GUI） | 界面图形化输入 |
+| `securevault lock <文件夹路径>` | 将指定文件夹原地加密锁定为保险箱 | 控制台安全交互输入并二次确认 |
+| `securevault unlock <文件夹路径>` | 将已锁定的文件夹原地解密还原 | 控制台安全交互输入 |
+| `securevault append <文件夹路径>` | 为已锁定文件夹继续加密新增文件/同步新目录 | 控制台安全交互输入原密码（不接收 `-p` 参数） |
+| `securevault status <文件夹路径>` | 查看文件夹当前是处于锁定（密文）还是解锁（明文）状态 | 无需密码 |
+| `securevault --help` | 查看帮助文档与子命令列表 | 无需密码 |
+
+---
+
+### 2. 命令详细说明与交互式流程
+
+- **启动 GUI 界面**：
   ```bash
   securevault gui
   # 或直接运行（无子命令默认启动 GUI）：
   securevault
   ```
-- **加密锁定**：
+
+- **加密锁定（交互式设置并确认密码）**：
   ```bash
   securevault lock /path/to/folder
-  # 或者通过 -p 指定密码（支持中文）：
-  securevault lock /path/to/folder -p "我的中文密码123"
   ```
-- **解密还原**：
+  执行后将弹出交互式密码提示（字符不回显），需输入并二次确认：
+  ```text
+  Enter new password: [输入密码，无回显]
+  Confirm password:   [再次确认密码]
+  ```
+
+- **解密还原（交互式验证密码）**：
   ```bash
   securevault unlock /path/to/folder
-  # 或者指定密码：
-  securevault unlock /path/to/folder -p "我的中文密码123"
   ```
-- **继续加密新增文件**：
+  执行后将弹出交互式输入提示：
+  ```text
+  Enter password: [输入密码，无回显]
+  ```
+
+- **继续加密新增文件（交互式输入原密码）**：
   ```bash
   securevault append /path/to/locked-folder
   ```
-  在隐藏输入提示中输入原密码。此命令不接受 `-p` / `--password` 参数。处理新增文件并同步新增空目录，已有密文数据块保持不变；相对路径冲突时停止，不覆盖。请勿在操作期间改动该文件夹内的文件或目录。
-- **查看状态**：
+  执行后将提示输入该保险箱的原密码：
+  ```text
+  Enter existing password: [输入原密码，无回显]
+  ```
+  处理新增文件并同步新增空目录，已有密文数据块保持不变；相对路径冲突时停止，不覆盖。请勿在操作期间改动该文件夹内的文件或目录。
+
+- **查看锁定状态**：
   ```bash
   securevault status /path/to/folder
   ```
-- **更换密码**：
-  如需更换密码，请先解密还原后再使用新密码加密：
+  输出示例：
+  * `🔒 Folder is LOCKED: /path/to/folder`（已加密锁定）
+  * `🔓 Folder is UNLOCKED: /path/to/folder`（明文解锁状态）
+
+- **更换密码流程（交互式）**：
+  如需更换密码，遵循“先解密还原、再重新加密锁定”的安全交互式流程：
   ```bash
-  securevault unlock /path/to/folder -p "原密码"
-  securevault lock /path/to/folder -p "新密码"
+  # 步骤 1：解密还原（交互式输入原密码）
+  securevault unlock /path/to/folder
+
+  # 步骤 2：重新加密（交互式设置并确认新密码）
+  securevault lock /path/to/folder
   ```
+
+---
+
+### 3. 自动化脚本参数说明（谨慎使用）
+
+针对无人值守 CI/CD 或自动化测试场景，`lock` 与 `unlock` 命令支持通过 `-p, --password` 传入密码：
+```bash
+# 仅建议在自动化脚本环境中使用
+securevault lock /path/to/folder -p "测试临时密码123"
+securevault unlock /path/to/folder -p "测试临时密码123"
+```
+
+> [!WARNING]
+> **安全警示**：日常使用**强烈推荐使用默认的交互式输入**。切勿在日常交互中使用 `-p / --password` 传递重要密码，否则密码将直接以明文形式暴露在系统命令行历史记录、任务管理器详情列以及 Windows 事件审核日志中。`append`（继续加密）命令出于安全审计考虑已硬性禁止 `-p` 参数。

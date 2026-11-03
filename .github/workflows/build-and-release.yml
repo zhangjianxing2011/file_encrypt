@@ -49,7 +49,7 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build macOS (dmg & app)
+    name: Build macOS Apple Silicon (dmg & app)
     runs-on: macos-latest
     steps:
       - name: Checkout repository
@@ -58,24 +58,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
 
-      - name: Build macOS binaries (Universal / Native)
+      - name: Build macOS Apple Silicon (aarch64) binary
         run: |
+          cargo build --release --target aarch64-apple-darwin
           mkdir -p target/release
-          # 尝试构建支持 Apple Silicon (M系列) 与 Intel 的 Universal 2 通用二进制
-          if cargo build --release --target aarch64-apple-darwin && cargo build --release --target x86_64-apple-darwin; then
-            echo "Universal build successful, combining with lipo..."
-            lipo -create -output target/release/securevault \
-              target/aarch64-apple-darwin/release/securevault \
-              target/x86_64-apple-darwin/release/securevault
-          else
-            echo "Universal build fallback to host build..."
-            cargo build --release
-          fi
+          cp target/aarch64-apple-darwin/release/securevault target/release/securevault
 
       - name: Package macOS App & DMG
         run: |
