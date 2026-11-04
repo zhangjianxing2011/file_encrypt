@@ -190,8 +190,37 @@ fn stage_meta(data: &Path, bytes: &[u8], pending: &mut Pending) -> Result<PathBu
     Ok(path)
 }
 
+/// Result of an append (incremental encryption) operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AppendReport {
+    /// Number of new files successfully added and encrypted.
+    pub added: usize,
+    /// Files that could not be opened for writing / were skipped (path, reason).
+    pub skipped: Vec<(PathBuf, String)>,
+}
+
+impl AppendReport {
+    /// Returns true if no files were skipped due to locks or permissions.
+    pub fn is_complete(&self) -> bool {
+        self.skipped.is_empty()
+    }
+}
+
+impl PartialEq<usize> for AppendReport {
+    fn eq(&self, other: &usize) -> bool {
+        self.added == *other
+    }
+}
+
+impl PartialEq<AppendReport> for usize {
+    fn eq(&self, other: &AppendReport) -> bool {
+        *self == other.added
+    }
+}
+
 /// Encrypt newly added plaintext without rewriting existing encrypted blobs.
-pub fn append(folder: &Path, password: &str) -> Result<usize> {
+pub fn append(folder: &Path, password: &str) -> Result<AppendReport> {
     append_with_hook(folder, password, |_| Ok(()))
 }
 
@@ -199,7 +228,7 @@ fn append_with_hook(
     folder: &Path,
     password: &str,
     mut hook: impl FnMut(Stage) -> Result<()>,
-) -> Result<usize> {
+) -> Result<AppendReport> {
     let folder = dunce_canonicalize(folder)?;
     let _operation = operation_lock(&folder)?;
     ensure!(is_locked(&folder), "Folder is not locked; encrypt it first");
@@ -278,32 +307,73 @@ fn append_with_hook(
         }
     }
     if files.is_empty() && !dirs.iter().any(|(_, new)| *new) {
-        return Ok(0);
+        return Ok(AppendReport {
+            added: 0,
+            skipped: Vec::new(),
+        });
     }
 
     let mut pending = Pending::default();
     let mut sources = Vec::new();
+    let mut successful_files = Vec::new();
+    let mut skipped = Vec::new();
     let old_count = index.files.len();
     for path in &files {
-        let mut source = super::incremental_source::open(path)
-            .with_context(|| format!("无法独占新增文件，原文未删除: {}", path.display()))?;
+        let mut source = match super::incremental_source::open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                skipped.push((path.clone(), format!("无法独占或打开新增文件: {e}")));
+                continue;
+            }
+        };
         let id = Uuid::new_v4().to_string();
         let blob = data.join(format!("{id}.enc"));
         // Reserve a unique path; never truncate an existing ciphertext blob.
-        fs::OpenOptions::new()
+        if let Err(e) = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&blob)?;
+            .open(&blob)
+        {
+            skipped.push((path.clone(), format!("无法创建密文文件: {e}")));
+            continue;
+        }
         pending.blobs.push(blob.clone());
-        let digest = crypto.encrypt_file(path, &blob)?;
-        fs::OpenOptions::new().write(true).open(&blob)?.sync_all()?;
-        source.verify(&digest)?;
-        index
-            .files
-            .push(build_file_entry(&id, path, &folder, Some(digest))?);
-        sources.push(source);
-        hook(Stage::AfterBlob)?;
+        let digest = match crypto.encrypt_file(path, &blob) {
+            Ok(d) => d,
+            Err(e) => {
+                skipped.push((path.clone(), format!("加密失败: {e}")));
+                continue;
+            }
+        };
+        if let Err(e) = fs::OpenOptions::new().write(true).open(&blob).and_then(|f| f.sync_all()) {
+            skipped.push((path.clone(), format!("同步密文失败: {e}")));
+            continue;
+        }
+        if let Err(e) = source.verify(&digest) {
+            skipped.push((path.clone(), format!("校验失败: {e}")));
+            continue;
+        }
+        match build_file_entry(&id, path, &folder, Some(digest)) {
+            Ok(entry) => {
+                index.files.push(entry);
+                sources.push(source);
+                successful_files.push(path.clone());
+                hook(Stage::AfterBlob)?;
+            }
+            Err(e) => {
+                skipped.push((path.clone(), format!("构建条目失败: {e}")));
+            }
+        }
     }
+
+    let has_new_dirs = dirs.iter().any(|(_, new)| *new);
+    if sources.is_empty() && !skipped.is_empty() && !has_new_dirs {
+        bail!(
+            "无法继续加密：所有待处理文件（共 {} 个）均被其他程序占用或无法访问。",
+            skipped.len()
+        );
+    }
+
     let new_dirs: Vec<PathBuf> = dirs
         .iter()
         .filter(|(_, new)| *new)
@@ -330,7 +400,7 @@ fn append_with_hook(
     finish.context("新索引已提交，但备份或清理准备未完成；新增明文全部保留。请保留整个文件夹，勿直接解密覆盖，先将残留明文移到安全位置")?;
 
     let mut failures = Vec::new();
-    for (path, source) in files.iter().zip(sources) {
+    for (path, source) in successful_files.iter().zip(sources) {
         if let Err(err) = source.erase() {
             failures.push(format!("{}: {err:#}", path.display()));
         }
@@ -348,7 +418,10 @@ fn append_with_hook(
     {
         let _ = set_hidden_attribute(&primary);
     }
-    Ok(index.files.len() - old_count)
+    Ok(AppendReport {
+        added: index.files.len() - old_count,
+        skipped,
+    })
 }
 
 #[cfg(test)]

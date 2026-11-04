@@ -498,13 +498,26 @@ fn status_banner(ui: &mut egui::Ui, status_message: &mut Option<(String, bool)>)
         None => return,
     };
 
-    let clean_msg = msg.trim_start_matches('✅').trim_start_matches('❌').trim();
+    let is_warning = msg.starts_with("⚠️");
+    let clean_msg = msg
+        .trim_start_matches('✅')
+        .trim_start_matches('❌')
+        .trim_start_matches("⚠️")
+        .trim();
+
     let (bg, stroke, text_color, icon) = if is_err {
         (
             egui::Color32::from_rgb(46, 18, 22),
             egui::Stroke::new(1.2, egui::Color32::from_rgb(239, 68, 68)),
             egui::Color32::from_rgb(255, 215, 220),
             "❌",
+        )
+    } else if is_warning {
+        (
+            egui::Color32::from_rgb(48, 36, 12),
+            egui::Stroke::new(1.2, egui::Color32::from_rgb(245, 158, 11)),
+            egui::Color32::from_rgb(254, 243, 199),
+            "⚠️",
         )
     } else {
         (
@@ -515,7 +528,8 @@ fn status_banner(ui: &mut egui::Ui, status_message: &mut Option<(String, bool)>)
         )
     };
 
-    let is_long_or_multiline = is_err && (clean_msg.starts_with("失败:") || clean_msg.len() > 60 || clean_msg.contains('\n'));
+    let is_long_or_multiline = clean_msg.contains('\n')
+        || (is_err && (clean_msg.starts_with("失败:") || clean_msg.len() > 60));
     let mut should_dismiss = false;
 
     egui::Frame::default()
@@ -524,51 +538,104 @@ fn status_banner(ui: &mut egui::Ui, status_message: &mut Option<(String, bool)>)
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             if is_long_or_multiline {
                 // Header row with Icon, Title, and Action Buttons (Copy + Close)
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), 22.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
+                        let header_title = if is_err {
+                            format!("{}  操作遇到错误", icon)
+                        } else if is_warning {
+                            format!("{}  操作提示 / 部分完成", icon)
+                        } else {
+                            format!("{}  操作提示", icon)
+                        };
+                        let header_color = if is_err {
+                            egui::Color32::from_rgb(255, 120, 120)
+                        } else if is_warning {
+                            egui::Color32::from_rgb(251, 191, 36)
+                        } else {
+                            egui::Color32::from_rgb(52, 211, 153)
+                        };
                         ui.label(
-                            egui::RichText::new(format!("{}  操作遇到错误", icon))
+                            egui::RichText::new(header_title)
                                 .size(13.0)
                                 .strong()
-                                .color(egui::Color32::from_rgb(255, 120, 120)),
+                                .color(header_color),
                         );
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Close button
                             let (close_rect, close_resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
                             if close_resp.hovered() {
-                                ui.painter().rect_filled(close_rect, 4.0, egui::Color32::from_rgb(70, 25, 30));
+                                let hover_bg = if is_err {
+                                    egui::Color32::from_rgb(70, 25, 30)
+                                } else if is_warning {
+                                    egui::Color32::from_rgb(75, 55, 20)
+                                } else {
+                                    egui::Color32::from_rgb(20, 60, 40)
+                                };
+                                ui.painter().rect_filled(close_rect, 4.0, hover_bg);
                             }
+                            let text_c = if close_resp.hovered() {
+                                egui::Color32::WHITE
+                            } else if is_err {
+                                egui::Color32::from_rgb(190, 150, 155)
+                            } else if is_warning {
+                                egui::Color32::from_rgb(220, 190, 140)
+                            } else {
+                                egui::Color32::from_rgb(140, 185, 160)
+                            };
                             ui.painter().text(
                                 close_rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 "✕",
                                 egui::FontId::proportional(11.0),
-                                if close_resp.hovered() { egui::Color32::WHITE } else { egui::Color32::from_rgb(190, 150, 155) },
+                                text_c,
                             );
-                            if close_resp.on_hover_text("关闭错误提示").clicked() {
+                            if close_resp.on_hover_text("关闭提示").clicked() {
                                 should_dismiss = true;
                             }
 
                             ui.add_space(4.0);
 
                             // Copy details button
+                            let (copy_text, copy_bg, copy_stroke, copy_fg) = if is_err {
+                                (
+                                    "复制报错",
+                                    egui::Color32::from_rgb(60, 25, 32),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 45, 55)),
+                                    egui::Color32::from_rgb(255, 205, 210),
+                                )
+                            } else if is_warning {
+                                (
+                                    "复制详情",
+                                    egui::Color32::from_rgb(65, 48, 18),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(135, 95, 25)),
+                                    egui::Color32::from_rgb(254, 230, 160),
+                                )
+                            } else {
+                                (
+                                    "复制详情",
+                                    egui::Color32::from_rgb(20, 55, 38),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 95, 60)),
+                                    egui::Color32::from_rgb(200, 245, 220),
+                                )
+                            };
                             if icon_text_button(
                                 ui,
                                 true,
                                 "📋",
-                                "复制报错",
-                                egui::Color32::from_rgb(60, 25, 32),
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 45, 55)),
-                                egui::Color32::from_rgb(255, 205, 210),
+                                copy_text,
+                                copy_bg,
+                                copy_stroke,
+                                copy_fg,
                                 egui::vec2(76.0, 22.0),
                                 4.0,
                             )
-                            .on_hover_text("复制完整报错内容到剪贴板")
+                            .on_hover_text("复制完整内容到剪贴板")
                             .clicked()
                             {
                                 ui.ctx().copy_text(clean_msg.to_string());
@@ -579,10 +646,26 @@ fn status_banner(ui: &mut egui::Ui, status_message: &mut Option<(String, bool)>)
 
                 ui.add_space(6.0);
 
-                // Multi-line error detail box with darker background
+                // Multi-line detail box with darker background
+                let (box_bg, box_stroke) = if is_err {
+                    (
+                        egui::Color32::from_rgb(32, 12, 16),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 28, 35)),
+                    )
+                } else if is_warning {
+                    (
+                        egui::Color32::from_rgb(34, 25, 8),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(85, 60, 18)),
+                    )
+                } else {
+                    (
+                        egui::Color32::from_rgb(8, 30, 20),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(20, 65, 42)),
+                    )
+                };
                 egui::Frame::default()
-                    .fill(egui::Color32::from_rgb(32, 12, 16))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 28, 35)))
+                    .fill(box_bg)
+                    .stroke(box_stroke)
                     .corner_radius(egui::CornerRadius::same(5))
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
@@ -614,6 +697,8 @@ fn status_banner(ui: &mut egui::Ui, status_message: &mut Option<(String, bool)>)
                         if close_resp.hovered() {
                             let hover_bg = if is_err {
                                 egui::Color32::from_rgb(70, 25, 30)
+                            } else if is_warning {
+                                egui::Color32::from_rgb(75, 55, 20)
                             } else {
                                 egui::Color32::from_rgb(20, 60, 40)
                             };
@@ -623,6 +708,8 @@ fn status_banner(ui: &mut egui::Ui, status_message: &mut Option<(String, bool)>)
                             egui::Color32::WHITE
                         } else if is_err {
                             egui::Color32::from_rgb(190, 150, 155)
+                        } else if is_warning {
+                            egui::Color32::from_rgb(220, 190, 140)
                         } else {
                             egui::Color32::from_rgb(140, 185, 160)
                         };
@@ -679,11 +766,101 @@ fn metric_card(ui: &mut egui::Ui, icon: &str, title: &str, value: &str, subtitle
         });
 }
 
-/// Safely open a file/folder in the native operating system file manager
+/// Safely open a directory or reveal a file in the native operating system file manager
 fn open_in_file_manager(path: &Path) {
+    if !path.exists() {
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer").arg(path).spawn();
+        if path.is_file() {
+            let _ = std::process::Command::new("explorer")
+                .arg(format!("/select,{}", path.display()))
+                .spawn();
+        } else {
+            let _ = std::process::Command::new("explorer").arg(path).spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if path.is_file() {
+            let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+        } else {
+            let _ = std::process::Command::new("open").arg(path).spawn();
+        }
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let folder = if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+    }
+}
+
+/// Safely open a file with the operating system's default application.
+/// On Windows, invokes ShellExecuteW with verb "open"; if no default application is associated,
+/// falls back to "openas" or OpenAs_RunDLL.
+/// IMPORTANT: Never runs `explorer <file>` because on Windows explorer opens the containing directory instead of opening the file!
+fn open_file_with_default_app(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if path.is_dir() {
+        open_in_file_manager(path);
+        return;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let wide_op_open: Vec<u16> = std::ffi::OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        let wide_op_openas: Vec<u16> = std::ffi::OsStr::new("openas").encode_wide().chain(Some(0)).collect();
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                lpOperation: *const u16,
+                lpFile: *const u16,
+                lpParameters: *const u16,
+                lpDirectory: *const u16,
+                nShowCmd: i32,
+            ) -> isize;
+        }
+
+        unsafe {
+            let res = ShellExecuteW(
+                std::ptr::null_mut(),
+                wide_op_open.as_ptr(),
+                wide_path.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1, // SW_SHOWNORMAL
+            );
+            if res <= 32 {
+                // If "open" fails (e.g. no associated default app, SE_ERR_NOASSOC = 31),
+                // trigger Windows "Open With..." dialog using verb "openas"
+                let res_openas = ShellExecuteW(
+                    std::ptr::null_mut(),
+                    wide_op_openas.as_ptr(),
+                    wide_path.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                );
+                if res_openas <= 32 {
+                    // Fallback to rundll32 shell32.dll,OpenAs_RunDLL
+                    let _ = std::process::Command::new("rundll32.exe")
+                        .arg("shell32.dll,OpenAs_RunDLL")
+                        .arg(path)
+                        .spawn();
+                }
+            }
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -692,6 +869,16 @@ fn open_in_file_manager(path: &Path) {
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+/// Universal helper: routes directories to file manager and files to default application
+#[allow(dead_code)]
+fn open_with_default_app(path: &Path) {
+    if path.is_dir() {
+        open_in_file_manager(path);
+    } else {
+        open_file_with_default_app(path);
     }
 }
 
@@ -911,6 +1098,30 @@ fn inspect_vault(path: &Path) -> VaultInspection {
     }
 }
 
+/// Helper to render right-aligned or inline size labels without ever overlapping names
+fn add_smart_size_label(ui: &mut egui::Ui, size_bytes: u64, color: egui::Color32) {
+    let size_text = format_bytes(size_bytes);
+    let font = egui::FontId::proportional(10.0);
+    let size_w = ui.painter().layout_no_wrap(size_text.clone(), font, egui::Color32::WHITE).size().x;
+    let row_left = ui.max_rect().min.x;
+    let row_right = ui.max_rect().max.x;
+    let current_x = ui.cursor().min.x;
+    let used_w = (current_x - row_left).max(0.0);
+    let target_w = (row_right - row_left).max(0.0);
+    let min_gap = 8.0;
+
+    if used_w + size_w + min_gap < target_w {
+        ui.add_space((target_w - used_w - size_w - 4.0).max(0.0));
+    } else {
+        ui.add_space(min_gap);
+    }
+    ui.label(
+        egui::RichText::new(size_text)
+            .size(10.0)
+            .color(color),
+    );
+}
+
 /// Recursive renderer for folder and file tree nodes with expand/collapse and selection support
 fn render_file_tree(
     ui: &mut egui::Ui,
@@ -986,7 +1197,17 @@ fn render_file_tree(
                     .min_size(egui::vec2(0.0, 18.0));
 
                     let btn_resp = ui.add(folder_btn);
-                    if btn_resp.on_hover_text("点击选中此目录在右侧进行加解密管理与查看").clicked() {
+                    if btn_resp.double_clicked() {
+                        open_in_file_manager(&node.path);
+                    }
+                    let folder_tooltip = format!(
+                        "{} 目录: {}\n大小: {}\n路径: {}\n\n💡 提示: 单击选中此目录，双击在文件管理器中打开",
+                        folder_icon,
+                        node.name,
+                        format_bytes(node.size),
+                        node.path.display()
+                    );
+                    if btn_resp.on_hover_text(folder_tooltip).clicked() {
                         *selected_target = Some((node.path.clone(), node.name.clone(), true));
                     }
 
@@ -998,14 +1219,8 @@ fn render_file_tree(
                             .color(egui::Color32::from_rgb(125, 140, 165)),
                     );
 
-                    // 4. Folder size (right aligned)
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format_bytes(node.size))
-                                .size(10.0)
-                                .color(egui::Color32::from_rgb(120, 135, 160)),
-                        );
-                    });
+                    // 4. Folder size (smart aligned, never overlapping)
+                    add_smart_size_label(ui, node.size, egui::Color32::from_rgb(120, 135, 160));
                 },
             );
 
@@ -1078,17 +1293,22 @@ fn render_file_tree(
                     .min_size(egui::vec2(0.0, 18.0));
 
                     let file_resp = ui.add(file_btn);
-                    if file_resp.on_hover_text("点击查看此文件详情").clicked() {
+                    if file_resp.double_clicked() {
+                        open_file_with_default_app(&node.path);
+                    }
+                    let file_tooltip = format!(
+                        "{} 文件: {}\n大小: {}\n路径: {}\n\n💡 提示: 单击选中查看详情，双击使用系统默认程序打开文件",
+                        file_icon,
+                        node.name,
+                        format_bytes(node.size),
+                        node.path.display()
+                    );
+                    if file_resp.on_hover_text(file_tooltip).clicked() {
                         *selected_target = Some((node.path.clone(), node.name.clone(), false));
                     }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format_bytes(node.size))
-                                .size(10.0)
-                                .color(egui::Color32::from_rgb(120, 135, 160)),
-                        );
-                    });
+                    // File size (smart aligned, never overlapping)
+                    add_smart_size_label(ui, node.size, egui::Color32::from_rgb(120, 135, 160));
                 },
             );
         }
@@ -1517,7 +1737,12 @@ impl eframe::App for SecureVaultApp {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ui, |ui| {
-                self.ui_central_panel(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("central_panel_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.ui_central_panel(ui);
+                    });
             });
 
         // ── Exit Re-encrypt Modal Dialog (Requirement 3) ──
@@ -1761,6 +1986,7 @@ impl SecureVaultApp {
                     let mut trash_clicked = false;
                     let mut arrow_hovered = false;
                     let mut trash_hovered = false;
+                    let mut header_bottom_y = 0.0f32;
 
                     let card_frame_resp = egui::Frame::default()
                         .fill(card_bg)
@@ -1869,7 +2095,11 @@ impl SecureVaultApp {
                                     .corner_radius(egui::CornerRadius::same(5))
                                     .min_size(egui::vec2(0.0, 22.0));
 
-                                    if ui.add(name_btn).on_hover_text("点击选中此保险箱并在右侧进行加解密操作").clicked() {
+                                    let name_resp = ui.add(name_btn);
+                                    if name_resp.double_clicked() {
+                                        open_in_file_manager(&vault_item.path);
+                                    }
+                                    if name_resp.on_hover_text("单击选中此保险箱，双击在文件管理器中打开").clicked() {
                                         selected_target = Some((vault_item.path.clone(), vault_item.name.clone(), true, Some(idx)));
                                     }
 
@@ -1918,9 +2148,14 @@ impl SecureVaultApp {
                                 )
                                 .sense(egui::Sense::click()),
                             );
-                            if path_label_resp.on_hover_text("点击选中此文件夹并在右侧进行加解密操作").clicked() {
+                            if path_label_resp.double_clicked() {
+                                open_in_file_manager(&vault_item.path);
+                            }
+                            if path_label_resp.on_hover_text("单击选中此文件夹，双击在文件管理器中打开").clicked() {
                                 selected_target = Some((vault_item.path.clone(), vault_item.name.clone(), true, Some(idx)));
                             }
+
+                            header_bottom_y = ui.cursor().min.y;
 
                             // Foldable list of files / encrypted items under this folder
                             if is_expanded {
@@ -1940,163 +2175,193 @@ impl SecureVaultApp {
                                 };
 
                                 if let Some(insp) = insp {
-                                    if insp.is_locked {
-                                        let data_dir = vault_item.path.join(".vault_data");
-                                        let is_data_expanded = self.expanded_folders.contains(&data_dir);
-                                        let is_data_selected = self.selected_path == data_dir;
+                                    egui::ScrollArea::horizontal()
+                                        .id_salt(format!("vault_tree_hscroll_{}", idx))
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            if insp.is_locked {
+                                                let data_dir = vault_item.path.join(".vault_data");
+                                                let is_data_expanded = self.expanded_folders.contains(&data_dir);
+                                                let is_data_selected = self.selected_path == data_dir;
 
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(ui.available_width(), 22.0),
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| {
-                                                let (arrow_rect, arrow_resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                                                if arrow_resp.hovered() {
-                                                    ui.painter().rect_filled(arrow_rect, 3.0, egui::Color32::from_rgb(42, 54, 76));
-                                                }
-                                                let arrow_glyph = if is_data_expanded { "▼" } else { "▶" };
-                                                let arrow_color = if arrow_resp.hovered() {
-                                                    egui::Color32::WHITE
-                                                } else {
-                                                    egui::Color32::from_rgb(165, 180, 205)
-                                                };
-                                                ui.painter().text(
-                                                    arrow_rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    arrow_glyph,
-                                                    egui::FontId::proportional(10.0),
-                                                    arrow_color,
-                                                );
-
-                                                let btn = egui::Button::new(
-                                                    egui::RichText::new("📦  密文存储区 (.vault_data)")
-                                                        .size(11.5)
-                                                        .strong()
-                                                        .color(if is_data_selected {
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(ui.available_width(), 22.0),
+                                                    egui::Layout::left_to_right(egui::Align::Center),
+                                                    |ui| {
+                                                        let (arrow_rect, arrow_resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                                                        if arrow_resp.hovered() {
+                                                            ui.painter().rect_filled(arrow_rect, 3.0, egui::Color32::from_rgb(42, 54, 76));
+                                                        }
+                                                        let arrow_glyph = if is_data_expanded { "▼" } else { "▶" };
+                                                        let arrow_color = if arrow_resp.hovered() {
                                                             egui::Color32::WHITE
                                                         } else {
-                                                            egui::Color32::from_rgb(215, 230, 255)
-                                                        }),
-                                                )
-                                                .fill(if is_data_selected {
-                                                    egui::Color32::from_rgb(37, 99, 235)
-                                                } else {
-                                                    egui::Color32::TRANSPARENT
-                                                })
-                                                .stroke(if is_data_selected {
-                                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(96, 165, 250))
-                                                } else {
-                                                    egui::Stroke::NONE
-                                                })
-                                                .corner_radius(egui::CornerRadius::same(4))
-                                                .min_size(egui::vec2(0.0, 18.0));
-                                                let btn_resp = ui.add(btn);
-
-                                                if btn_resp.on_hover_text("点击选中此保险箱进行解密还原").clicked() {
-                                                    selected_target = Some((vault_item.path.clone(), vault_item.name.clone(), true, Some(idx)));
-                                                }
-
-                                                if arrow_resp.on_hover_text("折叠/展开密文存储区").clicked() {
-                                                    toggled_folders.push(data_dir.clone());
-                                                }
-
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(52, 211, 153),
-                                                    format!("{} 块 ({})", insp.encrypted_files.len(), format_bytes(insp.total_encrypted_bytes)),
-                                                );
-                                            },
-                                        );
-
-                                        if is_data_expanded {
-                                            ui.indent("enc_files_indent", |ui| {
-                                                if insp.encrypted_files.is_empty() {
-                                                    ui.label(egui::RichText::new("(空)").weak().size(10.5));
-                                                } else {
-                                                    for (fname, fsize) in &insp.encrypted_files {
-                                                        let enc_path = data_dir.join(fname);
-                                                        let is_enc_selected = self.selected_path == enc_path;
-
-                                                        ui.allocate_ui_with_layout(
-                                                            egui::vec2(ui.available_width(), 20.0),
-                                                            egui::Layout::left_to_right(egui::Align::Center),
-                                                            |ui| {
-                                                                let enc_btn = egui::Button::new(
-                                                                    egui::RichText::new(format!("🔒  {}", fname))
-                                                                        .size(10.5)
-                                                                        .monospace()
-                                                                        .color(if is_enc_selected {
-                                                                            egui::Color32::WHITE
-                                                                        } else {
-                                                                            egui::Color32::from_rgb(180, 195, 215)
-                                                                        }),
-                                                                )
-                                                                .fill(if is_enc_selected {
-                                                                    egui::Color32::from_rgb(30, 58, 110)
-                                                                } else {
-                                                                    egui::Color32::TRANSPARENT
-                                                                })
-                                                                .stroke(if is_enc_selected {
-                                                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 100, 180))
-                                                                } else {
-                                                                    egui::Stroke::NONE
-                                                                })
-                                                                .corner_radius(egui::CornerRadius::same(3))
-                                                                .min_size(egui::vec2(0.0, 18.0));
-
-                                                                if ui.add(enc_btn).on_hover_text("点击查看密文数据块详情与解密所属保险箱").clicked() {
-                                                                    selected_target = Some((enc_path, fname.clone(), false, Some(idx)));
-                                                                }
-
-                                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                                    ui.label(egui::RichText::new(format_bytes(*fsize)).size(10.0).weak());
-                                                                });
-                                                            },
+                                                            egui::Color32::from_rgb(165, 180, 205)
+                                                        };
+                                                        ui.painter().text(
+                                                            arrow_rect.center(),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            arrow_glyph,
+                                                            egui::FontId::proportional(10.0),
+                                                            arrow_color,
                                                         );
+
+                                                        let btn = egui::Button::new(
+                                                            egui::RichText::new("📦  密文存储区 (.vault_data)")
+                                                                .size(11.5)
+                                                                .strong()
+                                                                .color(if is_data_selected {
+                                                                    egui::Color32::WHITE
+                                                                } else {
+                                                                    egui::Color32::from_rgb(215, 230, 255)
+                                                                }),
+                                                        )
+                                                        .fill(if is_data_selected {
+                                                            egui::Color32::from_rgb(37, 99, 235)
+                                                        } else {
+                                                            egui::Color32::TRANSPARENT
+                                                        })
+                                                        .stroke(if is_data_selected {
+                                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(96, 165, 250))
+                                                        } else {
+                                                            egui::Stroke::NONE
+                                                        })
+                                                        .corner_radius(egui::CornerRadius::same(4))
+                                                        .min_size(egui::vec2(0.0, 18.0));
+                                                        let btn_resp = ui.add(btn);
+                                                        if btn_resp.double_clicked() {
+                                                            open_in_file_manager(&data_dir);
+                                                        }
+                                                        let data_tooltip = format!(
+                                                            "📦 密文存储区 (.vault_data)\n加密块数: {} 块\n总密文大小: {}\n路径: {}\n\n💡 提示: 单击选中此保险箱，双击在文件管理器中打开",
+                                                            insp.encrypted_files.len(),
+                                                            format_bytes(insp.total_encrypted_bytes),
+                                                            data_dir.display()
+                                                        );
+                                                        if btn_resp.on_hover_text(data_tooltip).clicked() {
+                                                            selected_target = Some((vault_item.path.clone(), vault_item.name.clone(), true, Some(idx)));
+                                                        }
+
+                                                        if arrow_resp.on_hover_text("折叠/展开密文存储区").clicked() {
+                                                            toggled_folders.push(data_dir.clone());
+                                                        }
+
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(52, 211, 153),
+                                                            format!("{} 块 ({})", insp.encrypted_files.len(), format_bytes(insp.total_encrypted_bytes)),
+                                                        );
+                                                    },
+                                                );
+
+                                                if is_data_expanded {
+                                                    ui.indent("enc_files_indent", |ui| {
+                                                        if insp.encrypted_files.is_empty() {
+                                                            ui.label(egui::RichText::new("(空)").weak().size(10.5));
+                                                        } else {
+                                                            for (fname, fsize) in &insp.encrypted_files {
+                                                                let enc_path = data_dir.join(fname);
+                                                                let is_enc_selected = self.selected_path == enc_path;
+
+                                                                ui.allocate_ui_with_layout(
+                                                                    egui::vec2(ui.available_width(), 20.0),
+                                                                    egui::Layout::left_to_right(egui::Align::Center),
+                                                                    |ui| {
+                                                                        let enc_btn = egui::Button::new(
+                                                                            egui::RichText::new(format!("🔒  {}", fname))
+                                                                                .size(10.5)
+                                                                                .monospace()
+                                                                                .color(if is_enc_selected {
+                                                                                    egui::Color32::WHITE
+                                                                                } else {
+                                                                                    egui::Color32::from_rgb(180, 195, 215)
+                                                                                }),
+                                                                        )
+                                                                        .fill(if is_enc_selected {
+                                                                            egui::Color32::from_rgb(30, 58, 110)
+                                                                        } else {
+                                                                            egui::Color32::TRANSPARENT
+                                                                        })
+                                                                        .stroke(if is_enc_selected {
+                                                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 100, 180))
+                                                                        } else {
+                                                                            egui::Stroke::NONE
+                                                                        })
+                                                                        .corner_radius(egui::CornerRadius::same(3))
+                                                                        .min_size(egui::vec2(0.0, 18.0));
+
+                                                                        let enc_resp = ui.add(enc_btn);
+                                                                        if enc_resp.double_clicked() {
+                                                                            open_file_with_default_app(&enc_path);
+                                                                        }
+                                                                        let enc_tooltip = format!(
+                                                                            "🔒 密文数据块: {}\n大小: {}\n路径: {}\n\n💡 提示: 单击查看密文数据块详情，双击使用默认程序打开",
+                                                                            fname,
+                                                                            format_bytes(*fsize),
+                                                                            enc_path.display()
+                                                                        );
+                                                                        if enc_resp.on_hover_text(enc_tooltip).clicked() {
+                                                                            selected_target = Some((enc_path, fname.clone(), false, Some(idx)));
+                                                                        }
+
+                                                                        add_smart_size_label(ui, *fsize, egui::Color32::from_rgb(140, 155, 180));
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            } else {
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(ui.available_width(), 20.0),
+                                                    egui::Layout::left_to_right(egui::Align::Center),
+                                                    |ui| {
+                                                        ui.label(egui::RichText::new("📂  明文目录清单:").size(11.5).strong());
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(255, 235, 170),
+                                                            format!("{} 文件, {} 目录 ({})", insp.total_plain_files, insp.total_plain_dirs, format_bytes(insp.total_plain_bytes)),
+                                                        );
+                                                    },
+                                                );
+
+                                                if insp.plain_tree.is_empty() {
+                                                    ui.indent("plain_files_indent", |ui| {
+                                                        ui.label(egui::RichText::new("(空文件夹)").size(10.5).weak());
+                                                    });
+                                                } else {
+                                                    let mut tree_target: Option<(PathBuf, String, bool)> = None;
+                                                    render_file_tree(
+                                                        ui,
+                                                        &insp.plain_tree,
+                                                        &self.expanded_folders,
+                                                        &mut toggled_folders,
+                                                        &mut tree_target,
+                                                        &self.selected_path,
+                                                        0,
+                                                    );
+                                                    if let Some((target_path, target_name, is_dir)) = tree_target {
+                                                        selected_target = Some((target_path, target_name, is_dir, Some(idx)));
                                                     }
                                                 }
-                                            });
-                                        }
-                                    } else {
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(ui.available_width(), 20.0),
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(egui::RichText::new("📂  明文目录清单:").size(11.5).strong());
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(255, 235, 170),
-                                                    format!("{} 文件, {} 目录 ({})", insp.total_plain_files, insp.total_plain_dirs, format_bytes(insp.total_plain_bytes)),
-                                                );
-                                            },
-                                        );
-
-                                        if insp.plain_tree.is_empty() {
-                                            ui.indent("plain_files_indent", |ui| {
-                                                ui.label(egui::RichText::new("(空文件夹)").size(10.5).weak());
-                                            });
-                                        } else {
-                                            let mut tree_target: Option<(PathBuf, String, bool)> = None;
-                                            render_file_tree(
-                                                ui,
-                                                &insp.plain_tree,
-                                                &self.expanded_folders,
-                                                &mut toggled_folders,
-                                                &mut tree_target,
-                                                &self.selected_path,
-                                                0,
-                                            );
-                                            if let Some((target_path, target_name, is_dir)) = tree_target {
-                                                selected_target = Some((target_path, target_name, is_dir, Some(idx)));
                                             }
-                                        }
-                                    }
+                                        });
                                 }
                             }
                         });
 
                     let card_rect = card_frame_resp.response.rect;
+                    let header_rect = egui::Rect::from_min_max(
+                        card_rect.min,
+                        egui::pos2(card_rect.max.x, header_bottom_y.max(card_rect.min.y + 24.0).min(card_rect.max.y)),
+                    );
+                    let target_card_rect = if is_expanded {
+                        header_rect
+                    } else {
+                        card_rect
+                    };
 
                     // Sense ONLY hover for card styling and cursor - NEVER consume or steal clicks from child widgets (arrow/trash/tree)!
                     let card_hover_interact = ui.interact(
-                        card_rect,
+                        target_card_rect,
                         ui.auto_id_with(("vault_card_hover_box", idx)),
                         egui::Sense::hover(),
                     );
@@ -2110,7 +2375,7 @@ impl SecureVaultApp {
 
                     if card_hover_interact.hovered() && !is_exact_selected {
                         ui.painter().rect_stroke(
-                            card_rect,
+                            target_card_rect,
                             egui::CornerRadius::same(7),
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 95, 140)),
                             egui::StrokeKind::Inside,
@@ -2127,7 +2392,15 @@ impl SecureVaultApp {
                     // and no specific item (like a child file) was selected.
                     let was_clicked_in_card = ui.input(|i| {
                         if i.pointer.primary_clicked() {
-                            i.pointer.interact_pos().map_or(false, |pos| card_rect.contains(pos))
+                            i.pointer.interact_pos().map_or(false, |pos| target_card_rect.contains(pos))
+                        } else {
+                            false
+                        }
+                    });
+
+                    let was_double_clicked_in_card = ui.input(|i| {
+                        if i.pointer.button_double_clicked(egui::PointerButton::Primary) {
+                            i.pointer.interact_pos().map_or(false, |pos| target_card_rect.contains(pos))
                         } else {
                             false
                         }
@@ -2141,6 +2414,16 @@ impl SecureVaultApp {
                     });
 
                     let toggled_any_folder = toggled_folders.len() > initial_toggled_count;
+
+                    if was_double_clicked_in_card
+                        && !arrow_clicked
+                        && !trash_clicked
+                        && !was_clicked_on_arrow_or_trash
+                        && !toggled_any_folder
+                        && selected_target.is_none()
+                    {
+                        open_in_file_manager(&vault_item.path);
+                    }
 
                     if was_clicked_in_card
                         && !arrow_clicked
@@ -2361,6 +2644,8 @@ impl SecureVaultApp {
             return;
         }
 
+        ui.set_width(ui.available_width());
+
         let mut return_to_parent: Option<(PathBuf, String, Option<usize>)> = None;
         let parent_vault = self.selected_index.and_then(|idx| self.tracked_vaults.get(idx)).cloned();
 
@@ -2378,6 +2663,7 @@ impl SecureVaultApp {
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     let folder_icon = if is_locked {
                         "🔒"
                     } else if is_subfolder {
@@ -2394,12 +2680,19 @@ impl SecureVaultApp {
                             |ui| {
                                 ui.label(egui::RichText::new(folder_icon).size(18.0));
                                 ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new(&self.selected_name)
-                                        .size(16.5)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
+                                let dir_name_resp = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&self.selected_name)
+                                            .size(16.5)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .sense(egui::Sense::click()),
                                 );
+                                if dir_name_resp.double_clicked() {
+                                    open_in_file_manager(&self.selected_path);
+                                }
+                                dir_name_resp.on_hover_text("双击在系统文件管理器中打开此目录");
                                 if is_subfolder {
                                     ui.add_space(6.0);
                                     render_badge_pill(
@@ -2418,39 +2711,14 @@ impl SecureVaultApp {
                             },
                         );
 
-                        ui.add_space(5.0);
+                        ui.add_space(6.0);
 
-                        // Row 2: Path text + [Copy Path] + [Open Folder] + [Back to Parent]
+                        // Row 2: Path text (left) + Action buttons [Copy Path] + [Open Folder] (right)
                         ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 24.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
+                            egui::vec2(ui.available_width(), 26.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(self.selected_path.to_string_lossy())
-                                            .monospace()
-                                            .size(11.5)
-                                            .color(egui::Color32::from_rgb(155, 175, 205)),
-                                    )
-                                    .truncate(),
-                                );
-                                ui.add_space(8.0);
-                                if icon_text_button(
-                                    ui,
-                                    true,
-                                    "📋",
-                                    "复制路径",
-                                    egui::Color32::from_rgb(28, 36, 50),
-                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
-                                    egui::Color32::from_rgb(200, 215, 235),
-                                    egui::vec2(82.0, 24.0),
-                                    4.0,
-                                )
-                                .clicked()
-                                {
-                                    ui.ctx().copy_text(self.selected_path.to_string_lossy().to_string());
-                                    self.status_message = Some(("已将文件夹路径复制到剪贴板".into(), false));
-                                }
+                                // 1. Rightmost button: 打开目录
                                 if icon_text_button(
                                     ui,
                                     true,
@@ -2468,9 +2736,31 @@ impl SecureVaultApp {
                                     open_in_file_manager(&self.selected_path);
                                 }
 
+                                ui.add_space(6.0);
+
+                                // 2. Second right button: 复制路径
+                                if icon_text_button(
+                                    ui,
+                                    true,
+                                    "📋",
+                                    "复制路径",
+                                    egui::Color32::from_rgb(28, 36, 50),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
+                                    egui::Color32::from_rgb(200, 215, 235),
+                                    egui::vec2(82.0, 24.0),
+                                    4.0,
+                                )
+                                .on_hover_text("复制当前文件夹完整路径到剪贴板")
+                                .clicked()
+                                {
+                                    ui.ctx().copy_text(self.selected_path.to_string_lossy().to_string());
+                                    self.status_message = Some(("已将文件夹路径复制到剪贴板".into(), false));
+                                }
+
+                                // 3. Third right button (if subfolder): 返回主文件夹
                                 if is_subfolder {
                                     if let Some(parent) = &parent_vault {
-                                        ui.add_space(4.0);
+                                        ui.add_space(6.0);
                                         if icon_text_button(
                                             ui,
                                             true,
@@ -2489,6 +2779,22 @@ impl SecureVaultApp {
                                         }
                                     }
                                 }
+
+                                ui.add_space(8.0);
+
+                                // 4. Left side: Monospace path text, taking all remaining space
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(self.selected_path.to_string_lossy())
+                                                .monospace()
+                                                .size(11.5)
+                                                .color(egui::Color32::from_rgb(155, 175, 205)),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(self.selected_path.to_string_lossy());
+                                });
                             },
                         );
                     });
@@ -2529,6 +2835,7 @@ impl SecureVaultApp {
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(20, 16))
                 .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     match self.active_tab {
                         ActiveTab::Lock => {
                             if is_locked {
@@ -2609,6 +2916,21 @@ impl SecureVaultApp {
                                         self.start_lock_task(&target_path);
                                     }
                                 }
+
+                                ui.add_space(8.0);
+                                egui::Frame::default()
+                                    .fill(egui::Color32::from_rgb(18, 26, 38))
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 60, 85)))
+                                    .corner_radius(egui::CornerRadius::same(6))
+                                    .inner_margin(egui::Margin::symmetric(10, 8))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(
+                                            egui::RichText::new("💡 安全声明：强烈建议在已开启全盘加密（Windows BitLocker、macOS FileVault 或 Linux LUKS）的磁盘环境中使用。固态硬盘（SSD）的磨损均衡机制可能导致粉碎前的底层旧闪存块在物理芯片级残留；配合系统全盘加密可彻底阻断任何硬件取证恢复。")
+                                                .size(11.0)
+                                                .color(egui::Color32::from_rgb(160, 185, 215)),
+                                        );
+                                    });
                             }
                         }
                         ActiveTab::Unlock => {
@@ -2731,6 +3053,7 @@ impl SecureVaultApp {
                                     .corner_radius(egui::CornerRadius::same(7))
                                     .inner_margin(egui::Margin::symmetric(14, 10))
                                     .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(ui.available_width(), 20.0),
                                             egui::Layout::left_to_right(egui::Align::Center),
@@ -2766,6 +3089,7 @@ impl SecureVaultApp {
                                         spec_line(ui, "密钥派生算法:", "Argon2id (m_cost=64MB, t=3)", "· 抵御GPU与专用芯片暴力破解");
                                         spec_line(ui, "完整性防篡改:", "Poly1305 MAC 128位认证标签", "· 杜绝数据污染与静默损坏");
                                         spec_line(ui, "双份冗余镜像:", ".vault_meta 自动双写备份", "· 防止元数据意外丢失");
+                                        spec_line(ui, "推荐存储环境:", "BitLocker / FileVault / LUKS", "· 配合全盘加密彻底杜绝SSD底层磨损残留");
                                     });
                             }
                         }
@@ -2785,6 +3109,7 @@ impl SecureVaultApp {
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     let file_icon = if is_enc_file { "🔒" } else { "📄" };
 
                     ui.vertical(|ui| {
@@ -2795,12 +3120,19 @@ impl SecureVaultApp {
                             |ui| {
                                 ui.label(egui::RichText::new(file_icon).size(18.0));
                                 ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new(&self.selected_name)
-                                        .size(16.5)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
+                                let file_name_resp = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&self.selected_name)
+                                            .size(16.5)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .sense(egui::Sense::click()),
                                 );
+                                if file_name_resp.double_clicked() {
+                                    open_file_with_default_app(&self.selected_path);
+                                }
+                                file_name_resp.on_hover_text("双击使用系统默认程序打开此文件");
                                 ui.add_space(8.0);
                                 if is_enc_file {
                                     render_badge_pill(
@@ -2828,40 +3160,13 @@ impl SecureVaultApp {
                             },
                         );
 
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
 
-                        // Row 2: Monospace path + Action buttons (aligned at 22px height)
+                        // Row 2: Monospace path (left) + Action buttons (right)
                         ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 24.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
+                            egui::vec2(ui.available_width(), 26.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(self.selected_path.to_string_lossy())
-                                            .monospace()
-                                            .size(11.5)
-                                            .color(egui::Color32::from_rgb(155, 175, 205)),
-                                    )
-                                    .truncate(),
-                                );
-                                ui.add_space(8.0);
-                                if icon_text_button(
-                                    ui,
-                                    true,
-                                    "📋",
-                                    "复制路径",
-                                    egui::Color32::from_rgb(28, 36, 50),
-                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
-                                    egui::Color32::from_rgb(200, 215, 235),
-                                    egui::vec2(80.0, 22.0),
-                                    4.0,
-                                )
-                                .clicked()
-                                {
-                                    ui.ctx().copy_text(self.selected_path.to_string_lossy().to_string());
-                                    self.status_message = Some(("已将文件路径复制到剪贴板".into(), false));
-                                }
-
                                 if !is_enc_file {
                                     if icon_text_button(
                                         ui,
@@ -2871,7 +3176,7 @@ impl SecureVaultApp {
                                         egui::Color32::from_rgb(28, 36, 50),
                                         egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
                                         egui::Color32::from_rgb(200, 215, 235),
-                                        egui::vec2(100.0, 22.0),
+                                        egui::vec2(100.0, 24.0),
                                         4.0,
                                     )
                                     .on_hover_text("在系统文件管理器中定位该文件")
@@ -2881,10 +3186,49 @@ impl SecureVaultApp {
                                             open_in_file_manager(parent);
                                         }
                                     }
+
+                                    ui.add_space(6.0);
+
+                                    if icon_text_button(
+                                        ui,
+                                        true,
+                                        "⚡",
+                                        "打开文件",
+                                        egui::Color32::from_rgb(28, 48, 75),
+                                        egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 95, 160)),
+                                        egui::Color32::from_rgb(220, 235, 255),
+                                        egui::vec2(86.0, 24.0),
+                                        4.0,
+                                    )
+                                    .on_hover_text("使用系统默认程序打开此文件")
+                                    .clicked()
+                                    {
+                                        open_file_with_default_app(&self.selected_path);
+                                    }
+
+                                    ui.add_space(6.0);
+                                }
+
+                                if icon_text_button(
+                                    ui,
+                                    true,
+                                    "📋",
+                                    "复制路径",
+                                    egui::Color32::from_rgb(28, 36, 50),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
+                                    egui::Color32::from_rgb(200, 215, 235),
+                                    egui::vec2(80.0, 24.0),
+                                    4.0,
+                                )
+                                .on_hover_text("复制当前文件完整路径到剪贴板")
+                                .clicked()
+                                {
+                                    ui.ctx().copy_text(self.selected_path.to_string_lossy().to_string());
+                                    self.status_message = Some(("已将文件路径复制到剪贴板".into(), false));
                                 }
 
                                 if let Some(parent) = &parent_vault {
-                                    ui.add_space(4.0);
+                                    ui.add_space(6.0);
                                     if icon_text_button(
                                         ui,
                                         true,
@@ -2893,7 +3237,7 @@ impl SecureVaultApp {
                                         egui::Color32::from_rgb(32, 45, 66),
                                         egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 80, 115)),
                                         egui::Color32::from_rgb(180, 210, 255),
-                                        egui::vec2(0.0, 22.0),
+                                        egui::vec2(0.0, 24.0),
                                         4.0,
                                     )
                                     .on_hover_text("切换选中该文件所属的保险箱文件夹")
@@ -2902,6 +3246,21 @@ impl SecureVaultApp {
                                         return_to_parent = Some((parent.path.clone(), parent.name.clone(), self.selected_index));
                                     }
                                 }
+
+                                ui.add_space(8.0);
+
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(self.selected_path.to_string_lossy())
+                                                .monospace()
+                                                .size(11.5)
+                                                .color(egui::Color32::from_rgb(155, 175, 205)),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(self.selected_path.to_string_lossy());
+                                });
                             },
                         );
                     });
@@ -2916,6 +3275,7 @@ impl SecureVaultApp {
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(20, 16))
                 .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     if is_enc_file {
                         ui.allocate_ui_with_layout(
                             egui::vec2(ui.available_width(), 24.0),
@@ -3101,6 +3461,21 @@ impl SecureVaultApp {
                                 self.start_lock_task(&parent_path);
                             }
                         }
+
+                        ui.add_space(8.0);
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(18, 26, 38))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 60, 85)))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new("💡 安全声明：强烈建议在已开启全盘加密（Windows BitLocker、macOS FileVault 或 Linux LUKS）的磁盘环境中使用。固态硬盘（SSD）的磨损均衡机制可能导致粉碎前的底层旧闪存块在物理芯片级残留；配合系统全盘加密可彻底阻断任何硬件取证恢复。")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(160, 185, 215)),
+                                );
+                            });
                     }
                 });
         }
@@ -3405,8 +3780,26 @@ impl SecureVaultApp {
             let result = vault::append(&path, &password);
             drop(password);
             let message = match result {
-                Ok(0) => VaultTaskMsg::Success("未新增文件；空目录已同步，已有密文保持不变。".into()),
-                Ok(count) => VaultTaskMsg::Success(format!("✅ 已继续加密 {} 个新增文件，已有密文保持不变。", count)),
+                Ok(report) if report.is_complete() => {
+                    if report.added == 0 {
+                        VaultTaskMsg::Success("未新增文件；空目录已同步，已有密文保持不变。".into())
+                    } else {
+                        VaultTaskMsg::Success(format!("✅ 已继续加密 {} 个新增文件，已有密文保持不变。", report.added))
+                    }
+                }
+                Ok(report) => {
+                    let skipped_list: Vec<String> = report
+                        .skipped
+                        .iter()
+                        .map(|(path, err)| format!("  • {} — {}", path.display(), err))
+                        .collect();
+                    VaultTaskMsg::Success(format!(
+                        "⚠️ 增量加密部分完成：已加密 {} 个文件，{} 个文件因被占用或无权限而跳过。\n跳过文件：\n{}\n💡 占用解除后可再次点击【继续加密】。",
+                        report.added,
+                        report.skipped.len(),
+                        skipped_list.join("\n")
+                    ))
+                }
                 Err(error) => VaultTaskMsg::Error(format!("{:#}", error)),
             };
             let _ = tx.send(message);
@@ -3734,6 +4127,7 @@ impl SecureVaultApp {
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), 26.0),
                     egui::Layout::left_to_right(egui::Align::Center),
@@ -3898,6 +4292,7 @@ impl SecureVaultApp {
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), 26.0),
                     egui::Layout::left_to_right(egui::Align::Center),
@@ -4038,8 +4433,22 @@ impl SecureVaultApp {
             password.zeroize();
             if let Ok(tx) = tx_mutex.lock() {
                 match res {
-                    Ok(_) => {
-                        let _ = tx.send(VaultTaskMsg::Success("✅ 文件夹已成功加密锁定！".into()));
+                    Ok(report) => {
+                        if report.is_complete() {
+                            let _ = tx.send(VaultTaskMsg::Success("✅ 文件夹已成功加密锁定！".into()));
+                        } else {
+                            let skipped_list: Vec<String> = report
+                                .skipped_files
+                                .iter()
+                                .map(|(path, err)| format!("  • {} — {}", path.display(), err))
+                                .collect();
+                            let _ = tx.send(VaultTaskMsg::Success(format!(
+                                "⚠️ 部分加密完成：{} 个文件已加密保护，{} 个文件因被占用或无权限而跳过。\n跳过文件：\n{}\n💡 未加密的文件仍保留为明文。当文件占用解除后，可点击【继续加密】完成剩余文件的加密。",
+                                report.encrypted_files,
+                                report.skipped_files.len(),
+                                skipped_list.join("\n")
+                            )));
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(VaultTaskMsg::Error(e.to_string()));
@@ -4186,7 +4595,7 @@ impl SecureVaultApp {
                                 file_size,
                             }));
                         }
-                    })
+                    }).map(|_report| ())
                 } else {
                     vault::unlock_with_progress(&folder_path, &password, move |completed, ftotal, file_path, file_size| {
                         if let Ok(tx) = tx_prog.lock() {
@@ -4359,5 +4768,16 @@ mod tests {
         assert!(all_paths.contains(&sub2));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_open_with_default_app_signature() {
+        let path = std::env::temp_dir();
+        // Test that open_with_default_app and open_in_file_manager execute without panicking on valid paths
+        open_with_default_app(&path);
+        open_in_file_manager(&path);
+
+        let non_existent_file = std::env::temp_dir().join("securevault_non_existent_test_file.txt");
+        open_file_with_default_app(&non_existent_file);
     }
 }

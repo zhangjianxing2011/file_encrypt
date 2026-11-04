@@ -13,7 +13,8 @@ use walkdir::WalkDir;
 mod incremental;
 mod incremental_storage;
 mod incremental_source;
-pub use incremental::append;
+#[allow(unused_imports)]
+pub use incremental::{append, AppendReport};
 
 // ─── Concurrency Budget Helpers ─────────────────────────────────────
 
@@ -39,22 +40,70 @@ fn get_cleanup_thread_pool() -> Result<rayon::ThreadPool> {
 
 // ─── Public API ─────────────────────────────────────────────────────
 
+/// Result of a lock (encryption) operation that may have skipped locked/in-use files.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct LockReport {
+    /// Files successfully encrypted.
+    pub encrypted_files: usize,
+    /// Total bytes of files encrypted.
+    pub total_encrypted_bytes: u64,
+    /// Files that could not be opened for writing and were skipped (path, reason).
+    pub skipped_files: Vec<(PathBuf, String)>,
+}
+
+impl LockReport {
+    /// Returns true if all files were encrypted and none were skipped.
+    pub fn is_complete(&self) -> bool {
+        self.skipped_files.is_empty()
+    }
+}
+
+/// Check if a file can be opened for writing and securely deleted.
+/// If the file is marked read-only (common in git repositories or copied media),
+/// attempts to clear the read-only attribute first.
+fn check_file_writable(path: &Path) -> Result<(), std::io::Error> {
+    if let Ok(md) = fs::metadata(path) {
+        if md.permissions().readonly() {
+            let mut perms = md.permissions();
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Test opening with GENERIC_READ | GENERIC_WRITE, sharing FILE_SHARE_READ.
+        // This ensures no other process has exclusive write locks.
+        let _ = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x0000_0001)
+            .open(path)?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = fs::OpenOptions::new().write(true).open(path)?;
+    }
+    Ok(())
+}
+
 /// Encrypt and lock a folder in-place.
 ///
 /// 1. Scans all files and directories
-/// 2. Pre-checks write access on files to avoid partial failures
+/// 2. Pre-checks write access on files, skipping in-use/locked files without aborting others
 /// 3. Encrypts each file → .vault_data/{uuid}.enc with lock-free collection
 /// 4. Writes encrypted index → .vault_meta
 /// 5. Safely overwrites and deletes original files with bounded concurrency
 /// 6. Reuses scanned directory structure to eliminate duplicate filesystem walks
-pub fn lock(folder: &Path, password: &str) -> Result<()> {
+pub fn lock(folder: &Path, password: &str) -> Result<LockReport> {
     lock_with_progress(folder, password, |_, _, _, _| {})
 }
 
 /// Encrypt and lock a folder in-place with real-time per-file progress callback.
 ///
 /// Progress callback receives: `(completed_files, total_files, current_relative_path, file_size)`
-pub fn lock_with_progress<F>(folder: &Path, password: &str, progress: F) -> Result<()>
+pub fn lock_with_progress<F>(folder: &Path, password: &str, progress: F) -> Result<LockReport>
 where
     F: Fn(usize, usize, &str, u64) + Send + Sync,
 {
@@ -78,13 +127,43 @@ where
     let (files, dirs) = scan_folder(&folder)?;
     if files.is_empty() {
         println!("📁 Folder is empty — nothing to encrypt.");
-        return Ok(());
+        return Ok(LockReport {
+            encrypted_files: 0,
+            total_encrypted_bytes: 0,
+            skipped_files: Vec::new(),
+        });
     }
     println!(
         "📊 Found {} file(s) in {} director(ies)",
         files.len(),
         dirs.len() + 1
     );
+
+    // Pre-check: Determine which files can be opened for writing and which are locked/in-use
+    let mut files_to_encrypt = Vec::with_capacity(files.len());
+    let mut skipped_files = Vec::new();
+
+    for file_path in files {
+        match check_file_writable(&file_path) {
+            Ok(()) => files_to_encrypt.push(file_path),
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                eprintln!(
+                    "  ⚠️ File '{}' cannot be opened for writing (skipped): {}",
+                    file_path.display(),
+                    err_msg
+                );
+                skipped_files.push((file_path, err_msg));
+            }
+        }
+    }
+
+    if files_to_encrypt.is_empty() {
+        bail!(
+            "Cannot lock folder: all files ({} file(s)) cannot be opened for writing (possibly in use by another program). Aborted without modifying any files.",
+            skipped_files.len()
+        );
+    }
 
     // ── 2. Derive keys ──────────────────────────────────────────
     println!("🔑 Deriving encryption key (this may take a moment)...");
@@ -99,26 +178,14 @@ where
     }
     fs::create_dir_all(&vault_data)?;
 
-    // Pre-check: Ensure all files can be opened for writing before proceeding
-    for file_path in &files {
-        if let Err(e) = fs::OpenOptions::new().write(true).open(file_path) {
-            let _ = fs::remove_dir_all(&vault_data);
-            bail!(
-                "Cannot lock folder: file '{}' cannot be opened for writing (possibly in use by another program): {}. Aborted before modifying any files.",
-                file_path.display(),
-                e
-            );
-        }
-    }
-
     // ── 4. Encrypt files in parallel (Lock-free collection & bounded pool) ───
-    let pb = make_progress_bar(files.len() as u64, "Encrypting", "cyan");
+    let pb = make_progress_bar(files_to_encrypt.len() as u64, "Encrypting", "cyan");
     let crypto_pool = get_crypto_thread_pool()?;
-    let total_files = files.len();
+    let total_files = files_to_encrypt.len();
     let counter = std::sync::atomic::AtomicUsize::new(0);
 
     let results: Vec<Result<FileEntry, (PathBuf, anyhow::Error)>> = crypto_pool.install(|| {
-        files
+        files_to_encrypt
             .par_iter()
             .map(|file_path| {
                 let id = Uuid::new_v4().to_string();
@@ -195,11 +262,11 @@ where
     let _ = fs::write(vault_data.join(VAULT_META_BACKUP_FILE), &meta_json);
 
     // ── 7. Delete originals with bounded concurrency & error collection ───────
-    let pb = make_progress_bar(files.len() as u64, "Cleaning up", "red");
+    let pb = make_progress_bar(files_to_encrypt.len() as u64, "Cleaning up", "red");
     let cleanup_pool = get_cleanup_thread_pool()?;
 
     let cleanup_results: Vec<Result<(), (PathBuf, anyhow::Error)>> = cleanup_pool.install(|| {
-        files
+        files_to_encrypt
             .par_iter()
             .map(|file_path| {
                 let res = secure_delete(file_path).map_err(|e| (file_path.clone(), e));
@@ -242,12 +309,25 @@ where
     }
 
     let total_size: u64 = index.files.iter().map(|f| f.size).sum();
-    println!(
-        "✅ Locked! {} file(s), {} encrypted.",
-        index.files.len(),
-        format_size(total_size)
-    );
-    Ok(())
+    if skipped_files.is_empty() {
+        println!(
+            "✅ Locked! {} file(s), {} encrypted.",
+            index.files.len(),
+            format_size(total_size)
+        );
+    } else {
+        println!(
+            "⚠️ Partially locked! {} file(s) ({}) encrypted, {} file(s) skipped.",
+            index.files.len(),
+            format_size(total_size),
+            skipped_files.len()
+        );
+    }
+    Ok(LockReport {
+        encrypted_files: index.files.len(),
+        total_encrypted_bytes: total_size,
+        skipped_files,
+    })
 }
 
 /// Result of an unlock operation that may have partial successes.
@@ -1044,6 +1124,151 @@ mod tests {
 
         // Vault preserved for the missing file
         assert!(dir.join(VAULT_META_FILE).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lock_readonly_git_files() {
+        let dir = setup_test_folder("readonly_git");
+        create_test_file(&dir, "git_obj.bin", b"git object 12345");
+        let path = dir.join("git_obj.bin");
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).unwrap();
+
+        let password = "pass-test-readonly";
+        let report = lock(&dir, password).unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.encrypted_files, 1);
+        assert!(!path.exists());
+
+        let un_report = unlock(&dir, password).unwrap();
+        assert!(un_report.is_complete());
+        assert_eq!(fs::read(&path).unwrap(), b"git object 12345");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lock_tolerant_with_locked_file() {
+        let dir = setup_test_folder("tolerant_lock");
+        create_test_file(&dir, "free.txt", b"I can be encrypted");
+        create_test_file(&dir, "locked.txt", b"I am currently in use");
+
+        let locked_path = dir.join("locked.txt");
+        let free_path = dir.join("free.txt");
+
+        #[cfg(windows)]
+        let lock_guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ: allows reading, but denies all writers (causing check_file_writable to fail)
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x0000_0001)
+                .open(&locked_path)
+                .unwrap()
+        };
+
+        let password = "pass-test-tolerant";
+
+        #[cfg(windows)]
+        {
+            let report = lock(&dir, password).unwrap();
+            assert!(!report.is_complete());
+            assert_eq!(report.encrypted_files, 1);
+            assert_eq!(report.skipped_files.len(), 1);
+
+            // free.txt was encrypted and deleted
+            assert!(!free_path.exists());
+            // locked.txt was skipped and remains plaintext
+            assert!(locked_path.exists());
+            assert_eq!(fs::read(&locked_path).unwrap(), b"I am currently in use");
+            assert!(is_locked(&dir));
+
+            // Release lock
+            drop(lock_guard);
+
+            // Now run append to continue encrypting the previously skipped file
+            let append_report = append(&dir, password).unwrap();
+            assert!(append_report.is_complete());
+            assert_eq!(append_report.added, 1);
+            assert!(!locked_path.exists());
+
+            // Unlock and verify both files
+            let unlock_report = unlock(&dir, password).unwrap();
+            assert!(unlock_report.is_complete());
+            assert_eq!(fs::read(&free_path).unwrap(), b"I can be encrypted");
+            assert_eq!(fs::read(&locked_path).unwrap(), b"I am currently in use");
+        }
+
+        #[cfg(not(windows))]
+        {
+            let report = lock(&dir, password).unwrap();
+            assert!(report.is_complete());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_append_tolerant_with_locked_file() {
+        let dir = setup_test_folder("tolerant_append");
+        create_test_file(&dir, "initial.txt", b"Initial secure content");
+
+        let password = "pass-test-append-tolerant";
+        lock(&dir, password).unwrap();
+        assert!(is_locked(&dir));
+
+        create_test_file(&dir, "new_free.txt", b"New free content");
+        create_test_file(&dir, "new_locked.txt", b"New locked content");
+
+        let new_locked_path = dir.join("new_locked.txt");
+        let new_free_path = dir.join("new_free.txt");
+
+        #[cfg(windows)]
+        let lock_guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x0000_0001)
+                .open(&new_locked_path)
+                .unwrap()
+        };
+
+        #[cfg(windows)]
+        {
+            let report = append(&dir, password).unwrap();
+            assert!(!report.is_complete());
+            assert_eq!(report.added, 1);
+            assert_eq!(report.skipped.len(), 1);
+
+            // new_free.txt was encrypted
+            assert!(!new_free_path.exists());
+            // new_locked.txt remains plaintext
+            assert!(new_locked_path.exists());
+            assert_eq!(fs::read(&new_locked_path).unwrap(), b"New locked content");
+
+            // Release lock and append again
+            drop(lock_guard);
+            let append_report = append(&dir, password).unwrap();
+            assert!(append_report.is_complete());
+            assert_eq!(append_report.added, 1);
+            assert!(!new_locked_path.exists());
+
+            // Unlock and verify all 3 files
+            let unlock_report = unlock(&dir, password).unwrap();
+            assert!(unlock_report.is_complete());
+            assert_eq!(fs::read(dir.join("initial.txt")).unwrap(), b"Initial secure content");
+            assert_eq!(fs::read(&new_free_path).unwrap(), b"New free content");
+            assert_eq!(fs::read(&new_locked_path).unwrap(), b"New locked content");
+        }
+
+        #[cfg(not(windows))]
+        {
+            let report = append(&dir, password).unwrap();
+            assert!(report.is_complete());
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

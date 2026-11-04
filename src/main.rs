@@ -16,7 +16,11 @@ mod vault;
 #[command(about = "🔐 SecureVault - High-performance cross-platform folder encryption")]
 #[command(long_about = "Encrypt and lock folders with AES-256-GCM + Argon2id.\n\
     Works on both Windows and macOS. Files are encrypted in-place \n\
-    with filenames obfuscated. Password required to unlock.\n\
+    with filenames obfuscated. Password required to unlock.\n\n\
+    SECURITY RECOMMENDATION: For high-security environments, it is strongly\n\
+    recommended to use this tool on volumes protected by Full Disk Encryption\n\
+    (Windows BitLocker, macOS FileVault, or Linux LUKS) to prevent shredded\n\
+    original data from being recovered via SSD wear-leveling.\n\n\
     Run without arguments to launch the graphical user interface (GUI).")]
 struct Cli {
     #[command(subcommand)]
@@ -75,7 +79,20 @@ fn main() -> Result<()> {
                 }
                 None => prompt_new_password()?,
             };
-            vault::lock(&path, &pwd)?;
+            let report = vault::lock(&path, &pwd)?;
+            if !report.is_complete() {
+                eprintln!(
+                    "⚠️  {} file(s) were skipped (in use or locked by another program):",
+                    report.skipped_files.len()
+                );
+                for (path, err) in &report.skipped_files {
+                    eprintln!("  ⚠️  {} — {}", path.display(), err);
+                }
+                eprintln!(
+                    "💡 Successfully encrypted {} file(s). You can run 'append' once locks are released.",
+                    report.encrypted_files
+                );
+            }
         }
         Some(Commands::Unlock { path, password }) => {
             let pwd = match password {
@@ -100,11 +117,25 @@ fn main() -> Result<()> {
             if password.is_empty() {
                 anyhow::bail!("Password cannot be empty");
             }
-            let added = vault::append(&path, &password)?;
-            if added == 0 {
-                println!("No new files; empty directories synchronized. Existing encrypted files are unchanged.");
+            let report = vault::append(&path, &password)?;
+            if report.is_complete() {
+                if report.added == 0 {
+                    println!("No new files; empty directories synchronized. Existing encrypted files are unchanged.");
+                } else {
+                    println!("Encrypted {} new file(s). Existing encrypted files are unchanged.", report.added);
+                }
             } else {
-                println!("Encrypted {} new file(s). Existing encrypted files are unchanged.", added);
+                eprintln!(
+                    "⚠️  {} file(s) were skipped (in use or locked):",
+                    report.skipped.len()
+                );
+                for (path, err) in &report.skipped {
+                    eprintln!("  ⚠️  {} — {}", path.display(), err);
+                }
+                eprintln!(
+                    "💡 Encrypted {} new file(s). You can run 'append' again once locks are released.",
+                    report.added
+                );
             }
         }
         Some(Commands::Status { path }) => {

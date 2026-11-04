@@ -20,6 +20,13 @@ pub(super) struct SourceGuard {
 }
 
 pub(super) fn open(path: &Path) -> Result<SourceGuard> {
+    if let Ok(md) = fs::symlink_metadata(path) {
+        if md.permissions().readonly() {
+            let mut perms = md.permissions();
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
     ensure_plain_file(path)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true);
@@ -52,6 +59,13 @@ pub(super) fn open(path: &Path) -> Result<SourceGuard> {
 }
 
 fn ensure_plain_file(path: &Path) -> Result<()> {
+    if let Ok(md) = fs::symlink_metadata(path) {
+        if md.permissions().readonly() {
+            let mut perms = md.permissions();
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
         metadata.is_file() && !metadata.file_type().is_symlink(),
@@ -69,7 +83,7 @@ fn ensure_plain_file(path: &Path) -> Result<()> {
     }
     ensure!(
         !metadata.permissions().readonly(),
-        "Read-only plaintext source retained: {}",
+        "Read-only plaintext source could not be made writable: {}",
         path.display()
     );
     Ok(())
