@@ -113,6 +113,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::Append { path }) => {
+            eprintln!("💡 提示: 请输入该保险箱原加密密码（支持中文输入）。验证通过后仅对新增文件追加加密。");
             let password = Zeroizing::new(rpassword::prompt_password("Enter existing password: ")?);
             if password.is_empty() {
                 anyhow::bail!("Password cannot be empty");
@@ -187,6 +188,7 @@ fn launch_gui() -> Result<()> {
 
 /// Prompt for an existing password (single entry)
 fn prompt_password(prompt: &str) -> Result<String> {
+    eprintln!("💡 提示: 请输入加密时设置的原始密码（支持中文输入）。验证错误不会解密，多次尝试不会损坏密文。");
     let password = rpassword::prompt_password(prompt)?;
     if password.is_empty() {
         anyhow::bail!("Password cannot be empty");
@@ -196,6 +198,7 @@ fn prompt_password(prompt: &str) -> Result<String> {
 
 /// Prompt for a new password (with confirmation)
 fn prompt_new_password() -> Result<String> {
+    eprintln!("💡 提示: 密码支持中文、字母、数字及特殊符号。采用零知识高强加密，无密码找回机制，请务必牢记！");
     let password = rpassword::prompt_password("Enter new password: ")?;
     if password.is_empty() {
         anyhow::bail!("Password cannot be empty");

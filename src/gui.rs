@@ -2898,7 +2898,13 @@ impl SecureVaultApp {
 
                                 ui.add_space(6.0);
                                 ui.checkbox(&mut self.show_password, "显示明文密码");
-                                ui.add_space(14.0);
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("💡 提示：密码支持中文字符、字母、数字及特殊符号。采用零知识高强加密，无密码找回机制，请务必妥善保管并牢记密码！")
+                                        .size(11.5)
+                                        .color(egui::Color32::from_rgb(255, 215, 130)),
+                                );
+                                ui.add_space(10.0);
 
                                 let action_title = if is_subfolder {
                                     format!("执行【{}】子目录原地加密锁定", self.selected_name)
@@ -2977,7 +2983,13 @@ impl SecureVaultApp {
 
                                 ui.add_space(6.0);
                                 ui.checkbox(&mut self.show_password, "显示明文密码");
-                                ui.add_space(14.0);
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("💡 提示：请输入加密时设置的原始密码（支持中文输入）。若密码错误将无法还原文件，多次尝试不会损坏已有密文数据。")
+                                        .size(11.5)
+                                        .color(egui::Color32::from_rgb(175, 205, 235)),
+                                );
+                                ui.add_space(10.0);
 
                                 let action_title = if is_subfolder {
                                     format!("执行【{}】子目录解密还原", self.selected_name)
@@ -3328,7 +3340,13 @@ impl SecureVaultApp {
 
                         ui.add_space(6.0);
                         ui.checkbox(&mut self.show_password, "显示明文密码");
-                        ui.add_space(14.0);
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("💡 提示：请输入所属保险箱加密时设置的原始密码（支持中文输入）。验证错误不会解密，多次尝试不会损坏已有密文数据。")
+                                .size(11.5)
+                                .color(egui::Color32::from_rgb(175, 205, 235)),
+                        );
+                        ui.add_space(10.0);
 
                         if primary_action_button(
                             ui,
@@ -3441,7 +3459,13 @@ impl SecureVaultApp {
 
                         ui.add_space(6.0);
                         ui.checkbox(&mut self.show_password, "显示明文密码");
-                        ui.add_space(14.0);
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("💡 提示：密码支持中文字符、字母、数字及特殊符号。采用零知识高强加密，无密码找回机制，请务必妥善保管并牢记密码！")
+                                .size(11.5)
+                                .color(egui::Color32::from_rgb(255, 215, 130)),
+                        );
+                        ui.add_space(10.0);
 
                         if primary_action_button(
                             ui,
@@ -3622,6 +3646,12 @@ impl SecureVaultApp {
 
                 ui.add_space(6.0);
                 ui.checkbox(&mut self.exit_show_password, "显示明文密码");
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("💡 提示：将为所有明文文件夹统一设置此加密密钥（支持中文）。采用零知识加密，无找回机制，请妥善记录！")
+                        .size(11.5)
+                        .color(egui::Color32::from_rgb(255, 215, 130)),
+                );
 
                 if let Some(err) = &self.exit_error {
                     ui.add_space(6.0);
@@ -3754,7 +3784,13 @@ impl SecureVaultApp {
         });
         ui.add_space(6.0);
         ui.add_enabled(!self.is_busy, egui::Checkbox::new(&mut self.show_password, "显示明文密码"));
-        ui.add_space(14.0);
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("💡 提示：请输入该保险箱原加密密码（支持中文输入）。验证通过后仅对本次新增的文件与目录执行原地加密。")
+                .size(11.5)
+                .color(egui::Color32::from_rgb(175, 205, 235)),
+        );
+        ui.add_space(10.0);
         if primary_action_button(ui, !self.is_busy, "🔒", "继续加密", egui::Color32::from_rgb(16, 149, 90)).clicked() {
             if self.password.is_empty() {
                 self.status_message = Some(("请输入此文件夹的原密码".into(), true));
@@ -4030,6 +4066,20 @@ impl SecureVaultApp {
 
                 ui.add_space(4.0);
                 ui.checkbox(&mut batch.show_password, "显示明文密码");
+                ui.add_space(4.0);
+                if is_encrypt {
+                    ui.label(
+                        egui::RichText::new("💡 提示：所选的全部文件夹将统一使用此密码加密（支持中文）。采用零知识保护，无找回机制，请务必牢记！")
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(255, 215, 130)),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("💡 提示：将使用此密码尝试对所选保险箱批量解密还原（支持中文）。若密码不匹配则会自动跳过，不影响数据安全。")
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(175, 205, 235)),
+                    );
+                }
 
                 if let Some(err) = &batch.error {
                     ui.add_space(6.0);

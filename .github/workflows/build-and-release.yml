@@ -69,12 +69,12 @@ jobs:
           mkdir -p target/release
           cp target/aarch64-apple-darwin/release/securevault target/release/securevault
 
-      - name: Package macOS App & DMG
+      - name: Package macOS App & DMG (with ad-hoc signing)
         run: |
           chmod +x package_mac.sh
           ./package_mac.sh target/release/securevault
-          # 移除隔离属性，防止下载后 Gatekeeper 报"已损坏"
-          xattr -cr SecureVault.app 2>/dev/null || true
+          # 验证签名
+          codesign -vv SecureVault.app 2>&1 || true
           cp SecureVault.dmg SecureVault-macOS.dmg
 
       - name: Upload macOS Artifacts

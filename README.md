@@ -101,17 +101,40 @@ SecureVault 为**完全免安装的绿色便携软件**，不写注册表、不�
    * **图形界面**：直接双击 `SecureVault-Windows-x64.exe`（或重命名后的 `securevault.exe`）即可打开窗口。
    * **命令行使用**：在软件所在目录空白处按住 `Shift + 鼠标右键`，选择【在此处打开 PowerShell 窗口】或【在终端中打开】，直接输入 `.\SecureVault-Windows-x64.exe <命令>`（亦可将程序放入系统的 PATH 环境变量目录中简写为 `securevault`）。
 
-### macOS 用户使用方法
-1. **获取软件**：
-   * 下载 `SecureVault.dmg` 镜像打开后拖入“应用程序”文件夹，或下载 `SecureVault-macOS-portable.zip` 免安装包解压到任意目录使用。
-2. **首次打开安全提示（Gatekeeper 隔离处理）**：
-   * 因本软件开源且未加入付费苹果开发者计划，macOS 首次运行从网络下载的未签名应用时可能会提示 **“已损坏，无法打开”** 或 **“无法验证开发者”**。这不是文件真的损坏，而是 macOS Gatekeeper 安全机制对未签名应用的正常拦截。只需进行一次信任授权即可永久解决：
-     * **方式一（终端命令，推荐，可解决所有情况）**：打开“终端”，执行以下命令移除系统的下载隔离标记：
-       ```bash
-       sudo xattr -rd com.apple.quarantine /Applications/SecureVault.app
-       ```
-       如果是解压到其他目录使用，将路径替换为实际的 `.app` 所在路径即可。
-     * **方式二（图形界面，仅适用于“无法验证开发者”提示）**：按住键盘 `Control` 键同时用鼠标右键点击 `SecureVault.app`，在弹出菜单中点击【打开】，并在随后的安全确认弹窗中点击【打开】即可（仅需首次操作一次）。**注意：如果提示的是“已损坏，无法打开”，此方式无效，请使用方式一。**
+### macOS 用户使用方法与安装问题解决
+
+#### 1. 正确安装流程（避免“应该推出磁盘映像”提示）
+1. 从 GitHub Releases 下载 `SecureVault.dmg` 镜像文件。
+2. 双击打开 `SecureVault.dmg`。
+3. **将 `SecureVault.app` 图标拖入右侧的 `Applications`（应用程序）文件夹中**。
+4. **【关键步骤】** 拖拽复制完成后，请在访达（Finder）侧边栏或桌面上，右键点击 `SecureVault` 磁盘镜像图标选择**【推出】（Eject）**。
+   * ⚠️ **切勿直接在 DMG 磁盘卷里双击运行！** macOS 会检测到未安装在本地硬盘上而触发安全阻止，并弹出 *“你应该推出磁盘映像”*。
+
+---
+
+#### 2. 常见问题：提示“SecureVault.app 已损坏，无法打开。你应该推出磁盘映像。”
+
+从 GitHub 或浏览器下载的未公证（未向 Apple 每年缴纳 $99 开发者认证）第三方开源软件，会被 macOS Gatekeeper 自动附加系统隔离标记（`com.apple.quarantine`），导致系统误报“文件已损坏”。**这并非文件损坏，只需一次性解除隔离标记即可：**
+
+##### 方案 A：终端一键解除隔离（最快最彻底，强烈推荐）
+1. 按快捷键 `Command + 空格` 调出聚焦搜索（Spotlight），输入 `终端` 或 `Terminal` 并回车打开。
+2. 复制并粘贴以下命令，然后按回车执行：
+   ```bash
+   xattr -cr /Applications/SecureVault.app
+   ```
+   *注：如果系统提示无权限，请使用管理员权限执行（需输入 Mac 登录密码）：*
+   ```bash
+   sudo xattr -rd com.apple.quarantine /Applications/SecureVault.app
+   ```
+3. 执行完成后关闭终端，直接在【访达】->【应用程序】中双击 `SecureVault.app` 即可正常运行！
+
+##### 方案 B：右键打开或系统设置放行（适用于“无法验证开发者”提示）
+* **右键打开**：在【应用程序】中找到 `SecureVault.app`，按住键盘 `Control` 键同时鼠标点击（或直接鼠标右键），在弹出菜单中选择【打开】，并在弹窗中点击【仍要打开】或【打开】。
+* **系统设置放行**：双击被阻止后，打开 Mac【系统设置】->【隐私与安全性】，向下滚动到安全性区域，点击【仍要打开】。
+
+##### 方案 C：使用免安装绿色便携包（免 DMG 挂载）
+* 若不想处理 DMG 镜像挂载，可直接在 GitHub Release 页面下载免安装绿色包 **`SecureVault-macOS-portable.zip`**。
+* 下载后直接解压到任意文件夹（例如【下载】或【桌面】），按方案 B 右键【打开】即可使用。若解压后仍提示损坏，在终端对解压后的路径执行 `xattr -cr /路径/SecureVault.app` 即可。
 
 ---
 
