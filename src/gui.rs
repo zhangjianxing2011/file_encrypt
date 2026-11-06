@@ -1038,29 +1038,42 @@ fn count_tree_items(nodes: &[FileTreeNode]) -> (usize, usize) {
     (files, dirs)
 }
 
-fn collect_all_folder_paths(vaults: &[TrackedVault]) -> HashSet<PathBuf> {
+fn collect_single_vault_folder_paths(vault_path: &Path) -> HashSet<PathBuf> {
     let mut set = HashSet::new();
-    for v in vaults {
-        set.insert(v.path.clone());
-        set.insert(v.path.join(".vault_data"));
-        fn recurse_dirs(dir: &Path, set: &mut HashSet<PathBuf>) {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.is_dir() {
-                            let p = entry.path();
-                            set.insert(p.clone());
-                            recurse_dirs(&p, set);
-                        }
+    if !vault_path.exists() {
+        return set;
+    }
+    set.insert(vault_path.to_path_buf());
+    let data_dir = vault_path.join(".vault_data");
+    if data_dir.exists() {
+        set.insert(data_dir);
+    }
+    fn recurse_dirs(dir: &Path, set: &mut HashSet<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        let p = entry.path();
+                        set.insert(p.clone());
+                        recurse_dirs(&p, set);
                     }
                 }
             }
         }
-        recurse_dirs(&v.path, &mut set);
+    }
+    recurse_dirs(vault_path, &mut set);
+    set
+}
+
+#[allow(dead_code)]
+fn collect_all_folder_paths(vaults: &[TrackedVault]) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    for v in vaults {
+        set.extend(collect_single_vault_folder_paths(&v.path));
     }
     set
 }
@@ -1787,13 +1800,6 @@ impl eframe::App for SecureVaultApp {
                             open_in_file_manager(&self.app_dir);
                         }
 
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new("军工级文件加密 · AES-256-GCM + Argon2id")
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(115, 130, 155)),
-                        );
-
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.selected_is_dir && self.selected_path.exists() {
                                 let locked = vault::is_locked(&self.selected_path);
@@ -2043,32 +2049,6 @@ impl SecureVaultApp {
                     if refresh_resp.on_hover_text("刷新所有状态与文件清单").clicked() {
                         self.refresh_all_inspections();
                     }
-
-                    // Quick toggle all expanded / collapsed
-                    if !self.tracked_vaults.is_empty() {
-                        let all_expanded = self.tracked_vaults.iter().all(|v| self.expanded_folders.contains(&v.path));
-                        let (toggle_icon, toggle_label) = if all_expanded { ("⊟", "全部折叠") } else { ("⊞", "全部展开") };
-                        if icon_text_button(
-                            ui,
-                            true,
-                            toggle_icon,
-                            toggle_label,
-                            egui::Color32::from_rgb(26, 34, 48),
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 60, 84)),
-                            egui::Color32::from_rgb(180, 195, 220),
-                            egui::vec2(78.0, 24.0),
-                            5.0,
-                        )
-                        .on_hover_text("展开或折叠所有受保护文件夹及内部所有子文件夹")
-                        .clicked()
-                        {
-                            if all_expanded {
-                                self.expanded_folders.clear();
-                            } else {
-                                self.expanded_folders = collect_all_folder_paths(&self.tracked_vaults);
-                            }
-                        }
-                    }
                 });
             },
         );
@@ -2146,6 +2126,8 @@ impl SecureVaultApp {
 
         let mut selected_target: Option<(PathBuf, String, bool, Option<usize>)> = None;
         let mut toggled_folders: Vec<PathBuf> = Vec::new();
+        let mut bulk_expand_folders: Vec<PathBuf> = Vec::new();
+        let mut bulk_collapse_folders: Vec<PathBuf> = Vec::new();
         let mut move_request: Option<(usize, usize)> = None;
 
         let total_vaults = self.tracked_vaults.len();
@@ -2193,22 +2175,30 @@ impl SecureVaultApp {
                     };
 
                     let initial_toggled_count = toggled_folders.len();
+                    let initial_bulk_expand_count = bulk_expand_folders.len();
+                    let initial_bulk_collapse_count = bulk_collapse_folders.len();
                     let mut arrow_rect_opt: Option<egui::Rect> = None;
                     let mut trash_rect_opt: Option<egui::Rect> = None;
                     let mut up_rect_opt: Option<egui::Rect> = None;
                     let mut down_rect_opt: Option<egui::Rect> = None;
                     let mut handle_rect_opt: Option<egui::Rect> = None;
+                    let mut fold_all_rect_opt: Option<egui::Rect> = None;
 
                     let mut arrow_clicked = false;
                     let mut trash_clicked = false;
                     let mut up_clicked = false;
                     let mut down_clicked = false;
+                    let mut fold_all_clicked = false;
 
                     let mut arrow_hovered = false;
                     let mut trash_hovered = false;
                     let mut up_hovered = false;
                     let mut down_hovered = false;
+                    let mut fold_all_hovered = false;
                     let mut header_bottom_y = 0.0f32;
+
+                    let vault_paths = collect_single_vault_folder_paths(&vault_item.path);
+                    let is_vault_all_expanded = !vault_paths.is_empty() && vault_paths.iter().all(|p| self.expanded_folders.contains(p));
 
                     let card_frame_resp = egui::Frame::default()
                         .fill(card_bg)
@@ -2481,6 +2471,39 @@ impl SecureVaultApp {
                                         } else {
                                             up_resp.on_hover_text("已是第一项");
                                         }
+
+                                        ui.add_space(2.0);
+
+                                        // Fold all / Expand all button for this project (⊞ / ⊟)
+                                        let (fold_all_rect, fold_all_resp) = ui.allocate_exact_size(
+                                            egui::vec2(20.0, 22.0),
+                                            egui::Sense::click(),
+                                        );
+                                        fold_all_rect_opt = Some(fold_all_rect);
+                                        if fold_all_resp.hovered() {
+                                            fold_all_hovered = true;
+                                            ui.painter().rect_filled(fold_all_rect, 4.0, egui::Color32::from_rgb(38, 48, 68));
+                                        }
+                                        let (fold_all_icon, fold_all_tooltip) = if is_vault_all_expanded {
+                                            ("⊟", "全部折叠此项目及内部所有子文件夹")
+                                        } else {
+                                            ("⊞", "全部展开此项目及内部所有子文件夹")
+                                        };
+                                        ui.painter().text(
+                                            fold_all_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            fold_all_icon,
+                                            egui::FontId::proportional(11.0),
+                                            if fold_all_resp.hovered() { egui::Color32::WHITE } else { egui::Color32::from_rgb(140, 155, 180) },
+                                        );
+                                        if fold_all_resp.on_hover_text(fold_all_tooltip).clicked() {
+                                            fold_all_clicked = true;
+                                            if is_vault_all_expanded {
+                                                bulk_collapse_folders.extend(vault_paths.clone());
+                                            } else {
+                                                bulk_expand_folders.extend(vault_paths.clone());
+                                            }
+                                        }
                                     });
                                 },
                             );
@@ -2671,6 +2694,42 @@ impl SecureVaultApp {
                                                             egui::Color32::from_rgb(255, 235, 170),
                                                             format!("{} 文件, {} 目录 ({})", insp.total_plain_files, insp.total_plain_dirs, format_bytes(insp.total_plain_bytes)),
                                                         );
+
+                                                        if insp.total_plain_dirs > 0 {
+                                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                                let sub_paths: Vec<PathBuf> = vault_paths.iter().filter(|p| **p != vault_item.path).cloned().collect();
+                                                                let all_sub_expanded = !sub_paths.is_empty() && sub_paths.iter().all(|p| self.expanded_folders.contains(p));
+                                                                let (btn_icon, btn_text) = if all_sub_expanded {
+                                                                    ("⊟", "全部折叠")
+                                                                } else {
+                                                                    ("⊞", "全部展开")
+                                                                };
+                                                                if icon_text_button(
+                                                                    ui,
+                                                                    true,
+                                                                    btn_icon,
+                                                                    btn_text,
+                                                                    egui::Color32::from_rgb(26, 34, 48),
+                                                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 60, 84)),
+                                                                    egui::Color32::from_rgb(180, 195, 220),
+                                                                    egui::vec2(74.0, 19.0),
+                                                                    4.0,
+                                                                )
+                                                                .on_hover_text(if all_sub_expanded {
+                                                                    "折叠此项目内的所有子文件夹"
+                                                                } else {
+                                                                    "展开此项目内的所有子文件夹"
+                                                                })
+                                                                .clicked()
+                                                                {
+                                                                    if all_sub_expanded {
+                                                                        bulk_collapse_folders.extend(sub_paths);
+                                                                    } else {
+                                                                        bulk_expand_folders.extend(sub_paths);
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
                                                     },
                                                 );
 
@@ -2770,6 +2829,7 @@ impl SecureVaultApp {
                                 || handle_rect_opt.map_or(false, |r| r.contains(pos))
                                 || up_rect_opt.map_or(false, |r| r.contains(pos))
                                 || down_rect_opt.map_or(false, |r| r.contains(pos))
+                                || fold_all_rect_opt.map_or(false, |r| r.contains(pos))
                         })
                     });
 
@@ -2787,6 +2847,7 @@ impl SecureVaultApp {
                         && !trash_hovered
                         && !up_hovered
                         && !down_hovered
+                        && !fold_all_hovered
                         && !is_mouse_over_special
                         && self.drag_vault_source.is_none()
                     {
@@ -2820,16 +2881,20 @@ impl SecureVaultApp {
                                 || handle_rect_opt.map_or(false, |r| r.contains(pos))
                                 || up_rect_opt.map_or(false, |r| r.contains(pos))
                                 || down_rect_opt.map_or(false, |r| r.contains(pos))
+                                || fold_all_rect_opt.map_or(false, |r| r.contains(pos))
                         })
                     });
 
-                    let toggled_any_folder = toggled_folders.len() > initial_toggled_count;
+                    let toggled_any_folder = toggled_folders.len() > initial_toggled_count
+                        || bulk_expand_folders.len() > initial_bulk_expand_count
+                        || bulk_collapse_folders.len() > initial_bulk_collapse_count;
 
                     if was_double_clicked_in_card
                         && !arrow_clicked
                         && !trash_clicked
                         && !up_clicked
                         && !down_clicked
+                        && !fold_all_clicked
                         && !was_clicked_on_special
                         && !toggled_any_folder
                         && selected_target.is_none()
@@ -2843,6 +2908,7 @@ impl SecureVaultApp {
                         && !trash_clicked
                         && !up_clicked
                         && !down_clicked
+                        && !fold_all_clicked
                         && !was_clicked_on_special
                         && !toggled_any_folder
                         && selected_target.is_none()
@@ -2937,6 +3003,12 @@ impl SecureVaultApp {
             } else {
                 self.expanded_folders.insert(path);
             }
+        }
+        for path in bulk_expand_folders {
+            self.expanded_folders.insert(path);
+        }
+        for path in bulk_collapse_folders {
+            self.expanded_folders.remove(&path);
         }
 
         if let Some((target_path, target_name, is_dir, parent_idx)) = selected_target {
