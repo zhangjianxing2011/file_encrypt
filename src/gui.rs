@@ -105,6 +105,7 @@ pub struct FileTreeNode {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    pub is_locked: bool,
     pub size: u64,
     pub children: Vec<FileTreeNode>,
 }
@@ -971,44 +972,53 @@ fn save_tracked_vaults(list: &[TrackedVault]) {
 fn scan_plain_dir_tree(dir: &Path) -> Vec<FileTreeNode> {
     let mut nodes = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
-        let mut entries: Vec<_> = entries.flatten().collect();
-        // Sort: directories first, then alphabetical by name
-        entries.sort_by(|a, b| {
-            let a_is_dir = a.metadata().map(|m| m.is_dir()).unwrap_or(false);
-            let b_is_dir = b.metadata().map(|m| m.is_dir()).unwrap_or(false);
-            match (a_is_dir, b_is_dir) {
+        let mut entries: Vec<_> = entries
+            .flatten()
+            .filter_map(|e| {
+                let fname = e.file_name();
+                let fname_str = fname.to_string_lossy();
+                if fname_str.starts_with('.') {
+                    return None;
+                }
+                let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                Some((e, is_dir, fname))
+            })
+            .collect();
+
+        // Sort: directories first, then alphabetical by name (zero filesystem syscalls in comparator)
+        entries.sort_by(|(_, a_is_dir, a_name), (_, b_is_dir, b_name)| {
+            match (*a_is_dir, *b_is_dir) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => a.file_name().cmp(&b.file_name()),
+                _ => a_name.cmp(b_name),
             }
         });
 
-        for entry in entries {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if fname.starts_with('.') {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata() {
-                let path = entry.path();
-                if meta.is_dir() {
-                    let children = scan_plain_dir_tree(&path);
-                    let folder_size = sum_tree_size(&children);
-                    nodes.push(FileTreeNode {
-                        name: fname,
-                        path,
-                        is_dir: true,
-                        size: folder_size,
-                        children,
-                    });
-                } else {
-                    nodes.push(FileTreeNode {
-                        name: fname,
-                        path,
-                        is_dir: false,
-                        size: meta.len(),
-                        children: Vec::new(),
-                    });
-                }
+        for (entry, is_dir, fname) in entries {
+            let path = entry.path();
+            let fname_str = fname.to_string_lossy().to_string();
+            if is_dir {
+                let children = scan_plain_dir_tree(&path);
+                let folder_size = sum_tree_size(&children);
+                let folder_locked = vault::is_locked(&path);
+                nodes.push(FileTreeNode {
+                    name: fname_str,
+                    path,
+                    is_dir: true,
+                    is_locked: folder_locked,
+                    size: folder_size,
+                    children,
+                });
+            } else {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                nodes.push(FileTreeNode {
+                    name: fname_str,
+                    path,
+                    is_dir: false,
+                    is_locked: false,
+                    size,
+                    children: Vec::new(),
+                });
             }
         }
     }
@@ -1036,6 +1046,30 @@ fn count_tree_items(nodes: &[FileTreeNode]) -> (usize, usize) {
         }
     }
     (files, dirs)
+}
+
+/// In-memory folder path collector using cached inspection tree (0 disk syscalls).
+fn collect_vault_folder_paths_from_inspection(vault_path: &Path, insp: &VaultInspection) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    if !insp.exists {
+        return set;
+    }
+    set.insert(vault_path.to_path_buf());
+    if insp.is_locked {
+        let data_dir = vault_path.join(".vault_data");
+        set.insert(data_dir);
+    } else {
+        fn recurse_nodes(nodes: &[FileTreeNode], set: &mut HashSet<PathBuf>) {
+            for node in nodes {
+                if node.is_dir {
+                    set.insert(node.path.clone());
+                    recurse_nodes(&node.children, set);
+                }
+            }
+        }
+        recurse_nodes(&insp.plain_tree, &mut set);
+    }
+    set
 }
 
 fn collect_single_vault_folder_paths(vault_path: &Path) -> HashSet<PathBuf> {
@@ -1211,7 +1245,7 @@ fn render_file_tree(
                     }
 
                     // 2. Folder icon and name clickable button
-                    let folder_locked = vault::is_locked(&node.path);
+                    let folder_locked = node.is_locked;
                     let folder_icon = if folder_locked { "🔒" } else { "📁" };
 
                     let folder_btn = egui::Button::new(
@@ -2055,8 +2089,25 @@ impl SecureVaultApp {
 
         // ── Batch Operation Buttons (批量加密 / 批量解密) ──
         if !self.tracked_vaults.is_empty() {
-            let unlocked_count = self.tracked_vaults.iter().filter(|v| v.path.exists() && !vault::is_locked(&v.path)).count();
-            let locked_count = self.tracked_vaults.iter().filter(|v| v.path.exists() && vault::is_locked(&v.path)).count();
+            let (unlocked_count, locked_count) = self.tracked_vaults.iter().fold((0, 0), |(unlocked, locked), v| {
+                if let Some(insp) = self.inspection_cache.get(&v.path) {
+                    if !insp.exists {
+                        (unlocked, locked)
+                    } else if insp.is_locked {
+                        (unlocked, locked + 1)
+                    } else {
+                        (unlocked + 1, locked)
+                    }
+                } else if v.path.exists() {
+                    if vault::is_locked(&v.path) {
+                        (unlocked, locked + 1)
+                    } else {
+                        (unlocked + 1, locked)
+                    }
+                } else {
+                    (unlocked, locked)
+                }
+            });
 
             ui.add_space(4.0);
             ui.allocate_ui_with_layout(
@@ -2153,8 +2204,20 @@ impl SecureVaultApp {
                 for (idx, vault_item) in self.tracked_vaults.iter().enumerate() {
                     let is_exact_selected = self.selected_path == vault_item.path;
                     let is_child_active = self.selected_index == Some(idx) && !is_exact_selected;
-                    let locked = vault_item.path.exists() && vault::is_locked(&vault_item.path);
-                    let exists = vault_item.path.exists();
+
+                    let cached_insp = if is_exact_selected {
+                        self.inspection.clone()
+                    } else {
+                        self.inspection_cache.get(&vault_item.path).cloned()
+                    };
+
+                    let (exists, locked) = if let Some(i) = &cached_insp {
+                        (i.exists, i.exists && i.is_locked)
+                    } else {
+                        let ex = vault_item.path.exists();
+                        (ex, ex && vault::is_locked(&vault_item.path))
+                    };
+
                     let is_expanded = self.expanded_folders.contains(&vault_item.path);
 
                     let (card_bg, card_stroke) = if is_exact_selected {
@@ -2197,7 +2260,11 @@ impl SecureVaultApp {
                     let mut fold_all_hovered = false;
                     let mut header_bottom_y = 0.0f32;
 
-                    let vault_paths = collect_single_vault_folder_paths(&vault_item.path);
+                    let vault_paths = if let Some(i) = &cached_insp {
+                        collect_vault_folder_paths_from_inspection(&vault_item.path, i)
+                    } else {
+                        collect_single_vault_folder_paths(&vault_item.path)
+                    };
                     let is_vault_all_expanded = !vault_paths.is_empty() && vault_paths.iter().all(|p| self.expanded_folders.contains(p));
 
                     let card_frame_resp = egui::Frame::default()
@@ -2536,10 +2603,8 @@ impl SecureVaultApp {
                                 ui.add_space(4.0);
                                 ui.separator();
                                 ui.add_space(2.0);
-                                let insp = if is_exact_selected {
-                                    self.inspection.clone()
-                                } else if let Some(cached) = self.inspection_cache.get(&vault_item.path) {
-                                    Some(cached.clone())
+                                let insp = if let Some(cached) = cached_insp {
+                                    Some(cached)
                                 } else if !self.is_busy {
                                     let fresh = inspect_vault(&vault_item.path);
                                     self.inspection_cache.insert(vault_item.path.clone(), fresh.clone());
@@ -3219,7 +3284,9 @@ impl SecureVaultApp {
         let parent_vault = self.selected_index.and_then(|idx| self.tracked_vaults.get(idx)).cloned();
 
         if self.selected_is_dir {
-            let is_locked = self.selected_path.exists() && vault::is_locked(&self.selected_path);
+            let is_locked = self.inspection.as_ref().map(|i| i.is_locked).unwrap_or_else(|| {
+                self.selected_path.exists() && vault::is_locked(&self.selected_path)
+            });
             let is_subfolder = parent_vault
                 .as_ref()
                 .map(|parent| parent.path != self.selected_path)
@@ -5631,6 +5698,21 @@ mod tests {
         assert!(all_paths.contains(&sub1));
         assert!(all_paths.contains(&nested));
         assert!(all_paths.contains(&sub2));
+
+        // Test in-memory collect_vault_folder_paths_from_inspection matches disk collection
+        let insp = VaultInspection {
+            is_locked: false,
+            exists: true,
+            encrypted_files: Vec::new(),
+            total_encrypted_bytes: 0,
+            plain_tree: tree,
+            total_plain_bytes: total_size,
+            total_plain_files: files,
+            total_plain_dirs: dirs,
+            password_hint: None,
+        };
+        let insp_paths = collect_vault_folder_paths_from_inspection(&root, &insp);
+        assert_eq!(insp_paths, all_paths);
 
         let _ = std::fs::remove_dir_all(&root);
     }

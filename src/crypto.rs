@@ -167,7 +167,7 @@ impl CryptoEngine {
 
         let dst_file = File::create(dst)
             .map_err(|e| anyhow!("Cannot create encrypted file '{}': {}", dst.display(), e))?;
-        let mut writer = BufWriter::new(dst_file);
+        let mut writer = BufWriter::with_capacity(self.chunk_size + 1024, dst_file);
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.data_key));
 
@@ -237,11 +237,7 @@ impl CryptoEngine {
     ) -> Result<FileDigest> {
         let src_file = File::open(src)
             .map_err(|e| anyhow!("Cannot open encrypted file '{}': {}", src.display(), e))?;
-        let mut reader = BufReader::new(src_file);
-
-        let dst_file = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)
-            .map_err(|e| anyhow!("Cannot create output file '{}': {}", dst.display(), e))?;
-        let mut writer = BufWriter::new(dst_file);
+        let mut reader = BufReader::with_capacity(self.chunk_size + 1024, src_file);
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.data_key));
 
@@ -249,6 +245,10 @@ impl CryptoEngine {
         let mut header = [0u8; 4];
         reader.read_exact(&mut header)?;
         let chunk_size = u32::from_le_bytes(header) as usize;
+
+        let dst_file = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)
+            .map_err(|e| anyhow!("Cannot create output file '{}': {}", dst.display(), e))?;
+        let mut writer = BufWriter::with_capacity(chunk_size, dst_file);
 
         // Pre-allocate reusable buffers for in-place decryption
         let mut buf = vec![0u8; chunk_size];
