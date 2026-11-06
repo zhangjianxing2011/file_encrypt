@@ -175,6 +175,9 @@ pub struct SecureVaultApp {
 
     // Application directory where the executable resides
     app_dir: PathBuf,
+
+    // Drag-and-drop vault ordering
+    drag_vault_source: Option<usize>,
 }
 
 // ── Font Setup for Chinese Character Support ──
@@ -1433,6 +1436,26 @@ impl SecureVaultApp {
             is_exit_encrypting: false,
             confirm_remove_vault: None,
             app_dir: get_app_dir(),
+            drag_vault_source: None,
+        }
+    }
+
+    fn reorder_vaults(&mut self, from_idx: usize, to_idx: usize) {
+        if from_idx >= self.tracked_vaults.len() || to_idx >= self.tracked_vaults.len() || from_idx == to_idx {
+            return;
+        }
+        let vault = self.tracked_vaults.remove(from_idx);
+        self.tracked_vaults.insert(to_idx, vault);
+        save_tracked_vaults(&self.tracked_vaults);
+
+        if self.selected_index.is_some() {
+            self.selected_index = self.tracked_vaults.iter().position(|v| {
+                if self.selected_is_dir {
+                    v.path == self.selected_path
+                } else {
+                    self.selected_path.starts_with(&v.path)
+                }
+            });
         }
     }
 
@@ -2123,6 +2146,23 @@ impl SecureVaultApp {
 
         let mut selected_target: Option<(PathBuf, String, bool, Option<usize>)> = None;
         let mut toggled_folders: Vec<PathBuf> = Vec::new();
+        let mut move_request: Option<(usize, usize)> = None;
+
+        let total_vaults = self.tracked_vaults.len();
+        let pointer_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
+        let is_pointer_released = ui.input(|i| i.pointer.any_released());
+        let is_pointer_down = ui.input(|i| i.pointer.primary_down());
+
+        if !is_pointer_down && !is_pointer_released && self.drag_vault_source.is_some() {
+            self.drag_vault_source = None;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.drag_vault_source = None;
+        }
+
+        let mut hovered_drop_idx: Option<usize> = None;
+        let mut first_card_rect: Option<egui::Rect> = None;
+        let mut last_card_rect: Option<egui::Rect> = None;
 
         egui::ScrollArea::vertical()
             .id_salt("tracked_vaults_scroll")
@@ -2155,10 +2195,19 @@ impl SecureVaultApp {
                     let initial_toggled_count = toggled_folders.len();
                     let mut arrow_rect_opt: Option<egui::Rect> = None;
                     let mut trash_rect_opt: Option<egui::Rect> = None;
+                    let mut up_rect_opt: Option<egui::Rect> = None;
+                    let mut down_rect_opt: Option<egui::Rect> = None;
+                    let mut handle_rect_opt: Option<egui::Rect> = None;
+
                     let mut arrow_clicked = false;
                     let mut trash_clicked = false;
+                    let mut up_clicked = false;
+                    let mut down_clicked = false;
+
                     let mut arrow_hovered = false;
                     let mut trash_hovered = false;
+                    let mut up_hovered = false;
+                    let mut down_hovered = false;
                     let mut header_bottom_y = 0.0f32;
 
                     let card_frame_resp = egui::Frame::default()
@@ -2171,6 +2220,63 @@ impl SecureVaultApp {
                                 egui::vec2(ui.available_width(), 24.0),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
+                                    // 0. Drag & Drop handle (6 dots grip icon, 16x22)
+                                    let (handle_rect, handle_resp) = ui.allocate_exact_size(
+                                        egui::vec2(16.0, 22.0),
+                                        if total_vaults > 1 { egui::Sense::drag() } else { egui::Sense::hover() },
+                                    );
+                                    handle_rect_opt = Some(handle_rect);
+                                    let is_this_drag_source = self.drag_vault_source == Some(idx);
+                                    let handle_hovered = handle_resp.hovered();
+
+                                    if total_vaults > 1 {
+                                        if handle_resp.drag_started() || (handle_resp.dragged() && self.drag_vault_source.is_none()) {
+                                            self.drag_vault_source = Some(idx);
+                                        }
+                                        if handle_hovered && self.drag_vault_source.is_none() {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                                        }
+                                    }
+
+                                    if handle_hovered || is_this_drag_source {
+                                        ui.painter().rect_filled(
+                                            handle_rect,
+                                            4.0,
+                                            if is_this_drag_source {
+                                                egui::Color32::from_rgb(32, 54, 88)
+                                            } else {
+                                                egui::Color32::from_rgb(38, 48, 68)
+                                            },
+                                        );
+                                    }
+
+                                    let dot_color = if total_vaults <= 1 {
+                                        egui::Color32::from_rgb(55, 68, 90)
+                                    } else if is_this_drag_source {
+                                        egui::Color32::from_rgb(96, 165, 250)
+                                    } else if handle_hovered {
+                                        egui::Color32::from_rgb(220, 235, 255)
+                                    } else {
+                                        egui::Color32::from_rgb(115, 130, 155)
+                                    };
+
+                                    let cx = handle_rect.center().x;
+                                    let cy = handle_rect.center().y;
+                                    for col in &[-2.5, 2.5] {
+                                        for row in &[-5.0, 0.0, 5.0] {
+                                            ui.painter().circle_filled(
+                                                egui::pos2(cx + col, cy + row),
+                                                1.4,
+                                                dot_color,
+                                            );
+                                        }
+                                    }
+                                    if total_vaults > 1 {
+                                        handle_resp.on_hover_text("按住拖动以调整文件夹上下顺序");
+                                    }
+
+                                    ui.add_space(2.0);
+
                                     // 1. Fold / Expand arrow toggle button (clean, 22x22 perfectly centered square)
                                     let (arrow_rect, arrow_resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
                                     arrow_rect_opt = Some(arrow_rect);
@@ -2276,7 +2382,7 @@ impl SecureVaultApp {
                                         selected_target = Some((vault_item.path.clone(), vault_item.name.clone(), true, Some(idx)));
                                     }
 
-                                    // 4. Trash button on the far right (22x22 perfectly centered square)
+                                    // 4. Controls on the far right (Trash, Down, Up)
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         let (trash_rect, trash_resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
                                         trash_rect_opt = Some(trash_rect);
@@ -2302,6 +2408,78 @@ impl SecureVaultApp {
                                         {
                                             self.confirm_remove_vault = Some(vault_item.clone());
                                             trash_clicked = true;
+                                        }
+
+                                        ui.add_space(2.0);
+
+                                        // Move Down button (▼)
+                                        let can_move_down = idx + 1 < total_vaults;
+                                        let (down_rect, down_resp) = ui.allocate_exact_size(
+                                            egui::vec2(20.0, 22.0),
+                                            if can_move_down { egui::Sense::click() } else { egui::Sense::hover() },
+                                        );
+                                        down_rect_opt = Some(down_rect);
+                                        if can_move_down && down_resp.hovered() {
+                                            down_hovered = true;
+                                            ui.painter().rect_filled(down_rect, 4.0, egui::Color32::from_rgb(38, 48, 68));
+                                        }
+                                        let down_color = if !can_move_down {
+                                            egui::Color32::from_rgb(55, 68, 90)
+                                        } else if down_resp.hovered() {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::from_rgb(140, 155, 180)
+                                        };
+                                        ui.painter().text(
+                                            down_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "▼",
+                                            egui::FontId::proportional(10.0),
+                                            down_color,
+                                        );
+                                        if can_move_down {
+                                            if down_resp.on_hover_text("向下移动一项").clicked() {
+                                                down_clicked = true;
+                                                move_request = Some((idx, idx + 1));
+                                            }
+                                        } else {
+                                            down_resp.on_hover_text("已是最后一项");
+                                        }
+
+                                        ui.add_space(2.0);
+
+                                        // Move Up button (▲)
+                                        let can_move_up = idx > 0;
+                                        let (up_rect, up_resp) = ui.allocate_exact_size(
+                                            egui::vec2(20.0, 22.0),
+                                            if can_move_up { egui::Sense::click() } else { egui::Sense::hover() },
+                                        );
+                                        up_rect_opt = Some(up_rect);
+                                        if can_move_up && up_resp.hovered() {
+                                            up_hovered = true;
+                                            ui.painter().rect_filled(up_rect, 4.0, egui::Color32::from_rgb(38, 48, 68));
+                                        }
+                                        let up_color = if !can_move_up {
+                                            egui::Color32::from_rgb(55, 68, 90)
+                                        } else if up_resp.hovered() {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::from_rgb(140, 155, 180)
+                                        };
+                                        ui.painter().text(
+                                            up_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "▲",
+                                            egui::FontId::proportional(10.0),
+                                            up_color,
+                                        );
+                                        if can_move_up {
+                                            if up_resp.on_hover_text("向上移动一项").clicked() {
+                                                up_clicked = true;
+                                                move_request = Some((idx, idx - 1));
+                                            }
+                                        } else {
+                                            up_resp.on_hover_text("已是第一项");
                                         }
                                     });
                                 },
@@ -2522,6 +2700,52 @@ impl SecureVaultApp {
                         });
 
                     let card_rect = card_frame_resp.response.rect;
+                    if idx == 0 {
+                        first_card_rect = Some(card_rect);
+                    }
+                    if idx + 1 == total_vaults {
+                        last_card_rect = Some(card_rect);
+                    }
+
+                    // Drag target check and visual highlights
+                    let is_this_drag_source = self.drag_vault_source == Some(idx);
+                    let is_drop_target = if let Some(drag_from) = self.drag_vault_source {
+                        if drag_from != idx {
+                            pointer_pos.map_or(false, |pos| {
+                                pos.x >= card_rect.min.x - 20.0
+                                    && pos.x <= card_rect.max.x + 20.0
+                                    && pos.y >= card_rect.min.y - 3.0
+                                    && pos.y <= card_rect.max.y + 3.0
+                            })
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if is_drop_target {
+                        hovered_drop_idx = Some(idx);
+                        ui.painter().rect_filled(
+                            card_rect,
+                            egui::CornerRadius::same(7),
+                            egui::Color32::from_rgba_unmultiplied(59, 130, 246, 28),
+                        );
+                        ui.painter().rect_stroke(
+                            card_rect,
+                            egui::CornerRadius::same(7),
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(59, 130, 246)),
+                            egui::StrokeKind::Inside,
+                        );
+                    } else if is_this_drag_source {
+                        ui.painter().rect_stroke(
+                            card_rect,
+                            egui::CornerRadius::same(7),
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 120, 170)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+
                     let header_rect = egui::Rect::from_min_max(
                         card_rect.min,
                         egui::pos2(card_rect.max.x, header_bottom_y.max(card_rect.min.y + 24.0).min(card_rect.max.y)),
@@ -2532,21 +2756,24 @@ impl SecureVaultApp {
                         card_rect
                     };
 
-                    // Sense ONLY hover for card styling and cursor - NEVER consume or steal clicks from child widgets (arrow/trash/tree)!
+                    // Sense ONLY hover for card styling and cursor - NEVER consume or steal clicks from child widgets!
                     let card_hover_interact = ui.interact(
                         target_card_rect,
                         ui.auto_id_with(("vault_card_hover_box", idx)),
                         egui::Sense::hover(),
                     );
 
-                    let is_mouse_over_arrow_or_trash = ui.input(|i| {
+                    let is_mouse_over_special = ui.input(|i| {
                         i.pointer.hover_pos().map_or(false, |pos| {
                             arrow_rect_opt.map_or(false, |r| r.contains(pos))
                                 || trash_rect_opt.map_or(false, |r| r.contains(pos))
+                                || handle_rect_opt.map_or(false, |r| r.contains(pos))
+                                || up_rect_opt.map_or(false, |r| r.contains(pos))
+                                || down_rect_opt.map_or(false, |r| r.contains(pos))
                         })
                     });
 
-                    if card_hover_interact.hovered() && !is_exact_selected {
+                    if card_hover_interact.hovered() && !is_exact_selected && !is_drop_target && !is_this_drag_source {
                         ui.painter().rect_stroke(
                             target_card_rect,
                             egui::CornerRadius::same(7),
@@ -2555,13 +2782,20 @@ impl SecureVaultApp {
                         );
                     }
 
-                    if card_hover_interact.hovered() && !arrow_hovered && !trash_hovered && !is_mouse_over_arrow_or_trash {
+                    if card_hover_interact.hovered()
+                        && !arrow_hovered
+                        && !trash_hovered
+                        && !up_hovered
+                        && !down_hovered
+                        && !is_mouse_over_special
+                        && self.drag_vault_source.is_none()
+                    {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
 
                     // Card click switching directory:
                     // Only triggers if the user clicked inside the card bounding box,
-                    // but NOT on the fold arrow, NOT on trash, NOT on any subfolder fold arrow,
+                    // but NOT on the fold arrow, NOT on trash, NOT on reorder buttons,
                     // and no specific item (like a child file) was selected.
                     let was_clicked_in_card = ui.input(|i| {
                         if i.pointer.primary_clicked() {
@@ -2579,10 +2813,13 @@ impl SecureVaultApp {
                         }
                     });
 
-                    let was_clicked_on_arrow_or_trash = ui.input(|i| {
+                    let was_clicked_on_special = ui.input(|i| {
                         i.pointer.interact_pos().map_or(false, |pos| {
                             arrow_rect_opt.map_or(false, |r| r.contains(pos))
                                 || trash_rect_opt.map_or(false, |r| r.contains(pos))
+                                || handle_rect_opt.map_or(false, |r| r.contains(pos))
+                                || up_rect_opt.map_or(false, |r| r.contains(pos))
+                                || down_rect_opt.map_or(false, |r| r.contains(pos))
                         })
                     });
 
@@ -2591,9 +2828,12 @@ impl SecureVaultApp {
                     if was_double_clicked_in_card
                         && !arrow_clicked
                         && !trash_clicked
-                        && !was_clicked_on_arrow_or_trash
+                        && !up_clicked
+                        && !down_clicked
+                        && !was_clicked_on_special
                         && !toggled_any_folder
                         && selected_target.is_none()
+                        && self.drag_vault_source.is_none()
                     {
                         open_in_file_manager(&vault_item.path);
                     }
@@ -2601,9 +2841,12 @@ impl SecureVaultApp {
                     if was_clicked_in_card
                         && !arrow_clicked
                         && !trash_clicked
-                        && !was_clicked_on_arrow_or_trash
+                        && !up_clicked
+                        && !down_clicked
+                        && !was_clicked_on_special
                         && !toggled_any_folder
                         && selected_target.is_none()
+                        && self.drag_vault_source.is_none()
                     {
                         selected_target = Some((vault_item.path.clone(), vault_item.name.clone(), true, Some(idx)));
                     }
@@ -2611,6 +2854,81 @@ impl SecureVaultApp {
                     ui.add_space(5.0);
                 }
             });
+
+        // Drag-and-drop completion when mouse is released
+        if is_pointer_released {
+            if let Some(drag_from) = self.drag_vault_source {
+                let final_target = hovered_drop_idx.or_else(|| {
+                    pointer_pos.and_then(|pos| {
+                        if let (Some(first), Some(last)) = (first_card_rect, last_card_rect) {
+                            if pos.y < first.min.y {
+                                Some(0)
+                            } else if pos.y > last.max.y {
+                                Some(total_vaults - 1)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                });
+                if let Some(target_idx) = final_target {
+                    if drag_from != target_idx {
+                        move_request = Some((drag_from, target_idx));
+                    }
+                }
+                self.drag_vault_source = None;
+            }
+        }
+
+        // Render floating drag preview attached to pointer
+        if let Some(drag_from) = self.drag_vault_source {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            ui.ctx().request_repaint();
+
+            if let Some(pos) = pointer_pos {
+                let dragged_name = self.tracked_vaults.get(drag_from).map(|v| v.name.as_str()).unwrap_or("文件夹");
+                let drop_hint = if let Some(target) = hovered_drop_idx {
+                    format!("移动至第 {} 项", target + 1)
+                } else {
+                    "拖拽至目标位置后松开".to_string()
+                };
+                egui::Area::new(egui::Id::unique("vault_drag_floating_preview"))
+                    .order(egui::Order::Tooltip)
+                    .fixed_pos(pos + egui::vec2(16.0, 12.0))
+                    .interactable(false)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(24, 32, 48))
+                            .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(59, 130, 246)))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("📁").size(13.0));
+                                    ui.label(
+                                        egui::RichText::new(dragged_name)
+                                            .size(12.5)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("({})", drop_hint))
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(140, 185, 255)),
+                                    );
+                                });
+                            });
+                    });
+            }
+        }
+
+        // Execute reorder if requested (by drag-and-drop or ▲/▼ buttons)
+        if let Some((from_idx, to_idx)) = move_request {
+            self.reorder_vaults(from_idx, to_idx);
+        }
 
         // Apply toggled folder states safely outside immutable borrow
         for path in toggled_folders {
@@ -5254,5 +5572,68 @@ mod tests {
 
         let non_existent_file = std::env::temp_dir().join("securevault_non_existent_test_file.txt");
         open_file_with_default_app(&non_existent_file);
+    }
+
+    #[test]
+    fn test_reorder_vaults_logic() {
+        let mut app = SecureVaultApp {
+            tracked_vaults: vec![
+                TrackedVault { name: "A".into(), path: PathBuf::from("C:\\test\\A") },
+                TrackedVault { name: "B".into(), path: PathBuf::from("C:\\test\\B") },
+                TrackedVault { name: "C".into(), path: PathBuf::from("C:\\test\\C") },
+            ],
+            selected_index: Some(0),
+            selected_path: PathBuf::from("C:\\test\\A"),
+            selected_name: "A".into(),
+            selected_is_dir: true,
+            inspection: None,
+            inspection_cache: HashMap::new(),
+            expanded_folders: HashSet::new(),
+            active_tab: ActiveTab::Lock,
+            password: String::new(),
+            confirm_password: String::new(),
+            password_hint: String::new(),
+            show_password: false,
+            is_busy: false,
+            status_message: None,
+            progress_text: String::new(),
+            tx: std::sync::mpsc::channel().0,
+            rx: std::sync::mpsc::channel().1,
+            active_progress: None,
+            batch_dialog: None,
+            batch_running_info: None,
+            unlocked_during_session: HashSet::new(),
+            show_exit_dialog: false,
+            bypass_exit_check: false,
+            exit_password: String::new(),
+            exit_confirm_password: String::new(),
+            exit_password_hint: String::new(),
+            exit_show_password: false,
+            exit_error: None,
+            is_exit_encrypting: false,
+            confirm_remove_vault: None,
+            app_dir: PathBuf::from("C:\\test"),
+            drag_vault_source: None,
+        };
+
+        // Move A (idx 0) down to idx 1: [B, A, C]
+        app.reorder_vaults(0, 1);
+        assert_eq!(app.tracked_vaults[0].name, "B");
+        assert_eq!(app.tracked_vaults[1].name, "A");
+        assert_eq!(app.tracked_vaults[2].name, "C");
+        assert_eq!(app.selected_index, Some(1)); // Selected item A moved to idx 1
+
+        // Move C (idx 2) up to idx 0: [C, B, A]
+        app.reorder_vaults(2, 0);
+        assert_eq!(app.tracked_vaults[0].name, "C");
+        assert_eq!(app.tracked_vaults[1].name, "B");
+        assert_eq!(app.tracked_vaults[2].name, "A");
+        assert_eq!(app.selected_index, Some(2)); // Selected item A is now at idx 2
+
+        // Out of bounds or identity reorder does nothing
+        app.reorder_vaults(0, 0);
+        assert_eq!(app.tracked_vaults[0].name, "C");
+        app.reorder_vaults(0, 10);
+        assert_eq!(app.tracked_vaults[0].name, "C");
     }
 }
