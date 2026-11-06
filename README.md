@@ -81,7 +81,7 @@
 | 运行模式 | 最低支持的 Windows 版本 | 架构要求 | 关键限制与底层依赖说明 |
 | :--- | :--- | :--- | :--- |
 | **图形界面（UI / GUI）** | **Windows 10**（64位，1607+）<br>或 **Windows Server 2016** 及以上 | **64 位 (x64)** | 内置基于 `eframe` + `wgpu` 的现代图形栈，强制依赖 **DirectX 12**、现代 Vulkan 与 DXGI 1.4+。<br>❌ *Windows 7 / 8 / 8.1 / Server 2012 R2 因缺少 DirectX 12 驱动支持，无法运行 GUI 版本。* |
-| **集成发布包（CLI 命令行模式）**<br>*(即默认下载的 `SecureVault-Windows-x64.exe`)* | **Windows 10**（64位）<br>或 **Windows Server 2016** 及以上 | **64 位 (x64)** | 默认提供的绿色单文件同时内置了图形栈符号及 Rust 1.78+ 运行时库，系统环境基线与 UI 版一致。 |
+| **集成发布包（CLI 命令行模式）**<br>*(即下载的 `SecureVault-Windows-<版本号>-x64.exe`)* | **Windows 10**（64位）<br>或 **Windows Server 2016** 及以上 | **64 位 (x64)** | 默认提供的绿色单文件同时内置了图形栈符号及 Rust 1.78+ 运行时库，系统环境基线与 UI 版一致。 |
 | **独立纯命令行构建（Pure CLI）**<br>*(按需剥离 GUI 依赖单独编译)* | **Windows Server 2012 R2**（64位）<br>或 **Windows 8.1**（64位） | **64 位 (x64)** | 剥离图形渲染栈后，Argon2id、AES-256-GCM 等加密逻辑可向下兼容至 Server 2012 R2；需系统安装 **Universal C Runtime (KB2999226)** 补丁。<br>❌ *Windows 7 原生缺失 `ProcessPrng`、`WaitOnAddress` 等基础安全与并发 API，不予支持。* |
 
 > [!NOTE]
@@ -96,15 +96,15 @@ SecureVault 为**完全免安装的绿色便携软件**，不写注册表、不�
 
 ### Windows 用户使用方法
 1. **获取软件**：
-   * 下载单文件版 `SecureVault-Windows-x64.exe`，或下载并解压 `SecureVault-Windows-x64.zip`。
+   * 下载单文件版 `SecureVault-Windows-<版本号>-x64.exe`（如 `SecureVault-Windows-1.0.5-x64.exe`），或下载并解压 `SecureVault-Windows-<版本号>-x64.zip`。
 2. **运行使用**：
-   * **图形界面**：直接双击 `SecureVault-Windows-x64.exe`（或重命名后的 `securevault.exe`）即可打开窗口。
-   * **命令行使用**：在软件所在目录空白处按住 `Shift + 鼠标右键`，选择【在此处打开 PowerShell 窗口】或【在终端中打开】，直接输入 `.\SecureVault-Windows-x64.exe <命令>`（亦可将程序放入系统的 PATH 环境变量目录中简写为 `securevault`）。
+   * **图形界面**：直接双击 `SecureVault-Windows-<版本号>-x64.exe`（或重命名后的 `securevault.exe`）即可打开窗口。
+   * **命令行使用**：在软件所在目录空白处按住 `Shift + 鼠标右键`，选择【在此处打开 PowerShell 窗口】或【在终端中打开】，直接输入 `.\SecureVault-Windows-<版本号>-x64.exe <命令>`（亦可将程序放入系统的 PATH 环境变量目录中简写为 `securevault`）。
 
 ### macOS 用户使用方法与安装问题解决
 
 #### 1. 正确安装流程（避免“应该推出磁盘映像”提示）
-1. 从 GitHub Releases 下载 `SecureVault.dmg` 镜像文件。
+1. 从 GitHub Releases 下载 `SecureVault-macOS-<版本号>.dmg`（或 `SecureVault.dmg`）镜像文件。
 2. 双击打开 `SecureVault.dmg`。
 3. **将 `SecureVault.app` 图标拖入右侧的 `Applications`（应用程序）文件夹中**。
 4. **【关键步骤】** 拖拽复制完成后，请在访达（Finder）侧边栏或桌面上，右键点击 `SecureVault` 磁盘镜像图标选择**【推出】（Eject）**。

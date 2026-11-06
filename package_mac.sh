@@ -102,25 +102,27 @@ codesign --force --deep -s - "${BUNDLE}" 2>/dev/null && echo "   ✅ 签名成�
 xattr -cr "${BUNDLE}" 2>/dev/null || true
 
 # 打包成免安装 ZIP 包
-ZIP_NAME="${APP_NAME}-macOS-portable.zip"
-rm -f "${ZIP_NAME}"
+ZIP_NAME="${APP_NAME}-macOS-${APP_VERSION}-portable.zip"
+rm -f "${ZIP_NAME}" "${APP_NAME}-macOS-portable.zip"
 # 使用 ditto 打包以正确保留 macOS 扩展属性和权限
 if command -v ditto >/dev/null 2>&1; then
     ditto -c -k --keepParent "${BUNDLE}" "${ZIP_NAME}"
 else
     zip -q -r "${ZIP_NAME}" "${BUNDLE}"
 fi
+cp "${ZIP_NAME}" "${APP_NAME}-macOS-portable.zip"
 
 # 打包成 DMG 安装镜像（若环境支持 hdiutil）
-DMG_NAME="${APP_NAME}.dmg"
+DMG_NAME="${APP_NAME}-macOS-${APP_VERSION}.dmg"
 if command -v hdiutil >/dev/null 2>&1; then
     echo "💿 正在生成 DMG 安装镜像..."
     DMG_STAGING="dmg_staging"
-    rm -rf "${DMG_STAGING}" "${DMG_NAME}"
+    rm -rf "${DMG_STAGING}" "${DMG_NAME}" "${APP_NAME}.dmg"
     mkdir -p "${DMG_STAGING}"
     cp -R "${BUNDLE}" "${DMG_STAGING}/"
     ln -s /Applications "${DMG_STAGING}/Applications"
     hdiutil create -volname "${APP_NAME}" -srcfolder "${DMG_STAGING}" -ov -format UDZO "${DMG_NAME}" >/dev/null 2>&1
+    cp "${DMG_NAME}" "${APP_NAME}.dmg"
     rm -rf "${DMG_STAGING}"
 fi
 
