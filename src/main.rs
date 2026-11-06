@@ -164,10 +164,11 @@ fn load_app_icon() -> Option<eframe::egui::IconData> {
 }
 
 fn launch_gui() -> Result<()> {
+    let app_title = format!("SecureVault v{} - 跨平台安全文件夹保险箱 (免安装版)", env!("CARGO_PKG_VERSION"));
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([1248.0, 780.0])
         .with_min_inner_size([760.0, 560.0])
-        .with_title("SecureVault - 跨平台安全文件夹保险箱 (免安装版)");
+        .with_title(app_title);
 
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);

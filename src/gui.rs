@@ -168,6 +168,9 @@ pub struct SecureVaultApp {
 
     // Secondary confirmation dialog for removing a vault from management list (Requirement 1)
     confirm_remove_vault: Option<TrackedVault>,
+
+    // Application directory where the executable resides
+    app_dir: PathBuf,
 }
 
 // ── Font Setup for Chinese Character Support ──
@@ -458,14 +461,20 @@ fn render_tab_button(ui: &mut egui::Ui, current: ActiveTab, target: ActiveTab, i
     .clicked()
 }
 
-/// Helper to render clean, consistently bordered input fields (visible without click/focus)
+/// Helper to render clean, consistently bordered input fields (visible without click/focus) with placeholder hint
 fn bordered_text_edit<'a>(
     text: &'a mut String,
     password_mode: bool,
     min_width: f32,
+    hint_text: &str,
 ) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(text)
         .password(password_mode)
+        .hint_text(
+            egui::RichText::new(hint_text)
+                .size(11.5)
+                .color(egui::Color32::from_rgb(115, 130, 155)),
+        )
         .min_size(egui::vec2(min_width, 32.0))
         .frame(
             egui::Frame::default()
@@ -896,6 +905,16 @@ fn generate_random_64_char_password() -> String {
 }
 
 // ── Persistence Helpers ──
+
+/// Retrieve the directory containing the running executable, falling back to current working directory
+fn get_app_dir() -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
 
 fn get_config_path() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
@@ -1403,6 +1422,7 @@ impl SecureVaultApp {
             exit_error: None,
             is_exit_encrypting: false,
             confirm_remove_vault: None,
+            app_dir: get_app_dir(),
         }
     }
 
@@ -1682,21 +1702,58 @@ impl eframe::App for SecureVaultApp {
                         );
                         ui.add_space(8.0);
 
-                        // Version tag
+                        // Version badge
                         egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(20, 35, 60))
+                            .fill(egui::Color32::from_rgb(26, 44, 76))
                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246)))
                             .corner_radius(egui::CornerRadius::same(10))
-                            .inner_margin(egui::Margin::symmetric(6, 1))
+                            .inner_margin(egui::Margin::symmetric(8, 2))
                             .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new("免安装绿色版")
-                                        .size(10.5)
-                                        .color(egui::Color32::from_rgb(147, 197, 253)),
+                                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                        .size(11.0)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(190, 220, 255)),
                                 );
                             });
 
                         ui.add_space(4.0);
+
+                        // Portable tag
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(18, 38, 28))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(16, 185, 129)))
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .inner_margin(egui::Margin::symmetric(7, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("免安装绿色版")
+                                        .size(10.5)
+                                        .color(egui::Color32::from_rgb(167, 243, 208)),
+                                );
+                            });
+
+                        ui.add_space(8.0);
+
+                        // Quick action button in top header to open software directory
+                        if icon_text_button(
+                            ui,
+                            true,
+                            "📂",
+                            "打开软件目录",
+                            egui::Color32::from_rgb(28, 38, 54),
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(52, 70, 98)),
+                            egui::Color32::from_rgb(215, 230, 255),
+                            egui::vec2(110.0, 24.0),
+                            4.0,
+                        )
+                        .on_hover_text(format!("软件程序所在物理目录：\n{}\n\n点击直接在系统文件管理器中打开", self.app_dir.display()))
+                        .clicked()
+                        {
+                            open_in_file_manager(&self.app_dir);
+                        }
+
+                        ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new("军工级文件加密 · AES-256-GCM + Argon2id")
                                 .size(11.0)
@@ -1708,6 +1765,111 @@ impl eframe::App for SecureVaultApp {
                                 let locked = vault::is_locked(&self.selected_path);
                                 render_status_pill(ui, locked);
                             }
+                        });
+                    },
+                );
+            });
+
+        // ── Bottom Status Bar (Software Directory, Version, Engine Info) ──
+        egui::Panel::bottom("bottom_status_bar")
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(16, 21, 30))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(32, 42, 58)))
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new("📂 软件所在文件夹:")
+                                .size(11.5)
+                                .strong()
+                                .color(egui::Color32::from_rgb(180, 205, 235)),
+                        );
+                        ui.add_space(4.0);
+
+                        let app_dir_str = self.app_dir.to_string_lossy().to_string();
+                        let dir_resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&app_dir_str)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(220, 235, 255)),
+                            )
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                        );
+                        if dir_resp.double_clicked() {
+                            open_in_file_manager(&self.app_dir);
+                        }
+                        if dir_resp.clicked() {
+                            ui.ctx().copy_text(app_dir_str.clone());
+                            self.status_message = Some(("已复制软件所在文件夹路径到剪贴板".into(), false));
+                        }
+                        dir_resp.on_hover_text(format!(
+                            "软件程序所在物理路径: {}\n\n💡 提示: 单击快速复制路径，双击在系统文件管理器中打开",
+                            app_dir_str
+                        ));
+
+                        ui.add_space(8.0);
+                        if icon_text_button(
+                            ui,
+                            true,
+                            "↗",
+                            "打开目录",
+                            egui::Color32::from_rgb(26, 35, 50),
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
+                            egui::Color32::from_rgb(200, 215, 240),
+                            egui::vec2(76.0, 20.0),
+                            3.0,
+                        )
+                        .on_hover_text("在系统文件管理器中打开软件所在文件夹")
+                        .clicked()
+                        {
+                            open_in_file_manager(&self.app_dir);
+                        }
+
+                        ui.add_space(4.0);
+                        if icon_text_button(
+                            ui,
+                            true,
+                            "📋",
+                            "复制路径",
+                            egui::Color32::from_rgb(26, 35, 50),
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 86)),
+                            egui::Color32::from_rgb(200, 215, 240),
+                            egui::vec2(76.0, 20.0),
+                            3.0,
+                        )
+                        .on_hover_text("复制软件所在文件夹路径到剪贴板")
+                        .clicked()
+                        {
+                            ui.ctx().copy_text(app_dir_str.clone());
+                            self.status_message = Some(("已复制软件所在文件夹路径到剪贴板".into(), false));
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("SecureVault v{}", env!("CARGO_PKG_VERSION")))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(145, 175, 215)),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("·")
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(70, 85, 110)),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("零知识端到端保护")
+                                    .size(10.5)
+                                    .color(egui::Color32::from_rgb(115, 135, 160)),
+                            );
                         });
                     },
                 );
@@ -2595,7 +2757,7 @@ impl SecureVaultApp {
                             ui.label(egui::RichText::new("🛡️").size(40.0));
                             ui.add_space(8.0);
                             ui.label(
-                                egui::RichText::new("欢迎使用 SecureVault 文件夹保险箱")
+                                egui::RichText::new(format!("欢迎使用 SecureVault 文件夹保险箱 v{}", env!("CARGO_PKG_VERSION")))
                                     .size(17.0)
                                     .strong()
                                     .color(egui::Color32::WHITE),
@@ -2605,6 +2767,12 @@ impl SecureVaultApp {
                                 egui::RichText::new("请在左侧侧边栏中选择一个受保护文件夹，或点击【➕ 添加】选择本地文件夹。")
                                     .size(12.5)
                                     .color(egui::Color32::from_rgb(140, 155, 180)),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!("📂 软件所在文件夹：{}", self.app_dir.display()))
+                                    .size(11.5)
+                                    .color(egui::Color32::from_rgb(130, 155, 185)),
                             );
                             ui.add_space(14.0);
                             if icon_text_button(
@@ -2860,7 +3028,7 @@ impl SecureVaultApp {
                                         |ui| {
                                             ui.add_enabled(
                                                 !self.is_busy,
-                                                bordered_text_edit(&mut self.password, !self.show_password, 260.0),
+                                                bordered_text_edit(&mut self.password, !self.show_password, 260.0, "请输入加密密码 (支持中文)"),
                                             );
                                             ui.add_space(4.0);
                                             if icon_text_button(
@@ -2891,7 +3059,7 @@ impl SecureVaultApp {
                                     ui.label(egui::RichText::new("确认新密码:").size(13.0));
                                     ui.add_enabled(
                                         !self.is_busy,
-                                        bordered_text_edit(&mut self.confirm_password, !self.show_password, 260.0),
+                                        bordered_text_edit(&mut self.confirm_password, !self.show_password, 260.0, "请再次输入密码以确认"),
                                     );
                                     ui.end_row();
                                 });
@@ -2899,11 +3067,18 @@ impl SecureVaultApp {
                                 ui.add_space(6.0);
                                 ui.checkbox(&mut self.show_password, "显示明文密码");
                                 ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new("💡 提示：密码支持中文字符、字母、数字及特殊符号。采用零知识高强加密，无密码找回机制，请务必妥善保管并牢记密码！")
-                                        .size(11.5)
-                                        .color(egui::Color32::from_rgb(255, 215, 130)),
-                                );
+                                egui::Frame::default()
+                                    .fill(egui::Color32::from_rgb(36, 28, 12))
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 120, 20)))
+                                    .corner_radius(egui::CornerRadius::same(6))
+                                    .inner_margin(egui::Margin::symmetric(10, 6))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("💡 密码安全提示：密码支持中文字符、字母、数字及各类特殊符号。采用零知识高强物理级原地加密，无后门与密码找回机制，请务必妥善记录并牢记密码！")
+                                                .size(11.5)
+                                                .color(egui::Color32::from_rgb(255, 220, 140)),
+                                        );
+                                    });
                                 ui.add_space(10.0);
 
                                 let action_title = if is_subfolder {
@@ -2976,7 +3151,12 @@ impl SecureVaultApp {
                                     ui.label(egui::RichText::new("输入解密密码:").size(13.0));
                                     ui.add_enabled(
                                         !self.is_busy,
-                                        bordered_text_edit(&mut self.password, !self.show_password, 260.0),
+                                        bordered_text_edit(
+                                            &mut self.password,
+                                            !self.show_password,
+                                            260.0,
+                                            "请输入加密时设置的原始密码 (支持中文)",
+                                        ),
                                     );
                                     ui.end_row();
                                 });
@@ -2984,11 +3164,18 @@ impl SecureVaultApp {
                                 ui.add_space(6.0);
                                 ui.checkbox(&mut self.show_password, "显示明文密码");
                                 ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new("💡 提示：请输入加密时设置的原始密码（支持中文输入）。若密码错误将无法还原文件，多次尝试不会损坏已有密文数据。")
-                                        .size(11.5)
-                                        .color(egui::Color32::from_rgb(175, 205, 235)),
-                                );
+                                egui::Frame::default()
+                                    .fill(egui::Color32::from_rgb(18, 28, 44))
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 85, 140)))
+                                    .corner_radius(egui::CornerRadius::same(6))
+                                    .inner_margin(egui::Margin::symmetric(10, 6))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("💡 解密提示：请输入加密时设置的原始密码（支持中文输入）。采用零知识保护，若密码错误将无法还原文件，多次尝试不会损坏已有密文数据。")
+                                                .size(11.5)
+                                                .color(egui::Color32::from_rgb(190, 220, 255)),
+                                        );
+                                    });
                                 ui.add_space(10.0);
 
                                 let action_title = if is_subfolder {
@@ -3333,7 +3520,12 @@ impl SecureVaultApp {
                             ui.label(egui::RichText::new("输入解密密码:").size(13.0));
                             ui.add_enabled(
                                 !self.is_busy,
-                                bordered_text_edit(&mut self.password, !self.show_password, 260.0),
+                                bordered_text_edit(
+                                    &mut self.password,
+                                    !self.show_password,
+                                    260.0,
+                                    "请输入所属保险箱解密密码 (支持中文)",
+                                ),
                             );
                             ui.end_row();
                         });
@@ -3341,11 +3533,18 @@ impl SecureVaultApp {
                         ui.add_space(6.0);
                         ui.checkbox(&mut self.show_password, "显示明文密码");
                         ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("💡 提示：请输入所属保险箱加密时设置的原始密码（支持中文输入）。验证错误不会解密，多次尝试不会损坏已有密文数据。")
-                                .size(11.5)
-                                .color(egui::Color32::from_rgb(175, 205, 235)),
-                        );
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(18, 28, 44))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 85, 140)))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("💡 解密提示：请输入所属保险箱加密时设置的原始密码（支持中文输入）。验证错误不会解密，多次尝试不会损坏已有密文数据。")
+                                        .size(11.5)
+                                        .color(egui::Color32::from_rgb(190, 220, 255)),
+                                );
+                            });
                         ui.add_space(10.0);
 
                         if primary_action_button(
@@ -3421,7 +3620,12 @@ impl SecureVaultApp {
                                 |ui| {
                                     ui.add_enabled(
                                         !self.is_busy,
-                                        bordered_text_edit(&mut self.password, !self.show_password, 260.0),
+                                        bordered_text_edit(
+                                            &mut self.password,
+                                            !self.show_password,
+                                            260.0,
+                                            "请输入加密密码 (支持中文)",
+                                        ),
                                     );
                                     ui.add_space(4.0);
                                     if icon_text_button(
@@ -3452,7 +3656,12 @@ impl SecureVaultApp {
                             ui.label(egui::RichText::new("确认新密码:").size(13.0));
                             ui.add_enabled(
                                 !self.is_busy,
-                                bordered_text_edit(&mut self.confirm_password, !self.show_password, 260.0),
+                                bordered_text_edit(
+                                    &mut self.confirm_password,
+                                    !self.show_password,
+                                    260.0,
+                                    "请再次输入密码以确认",
+                                ),
                             );
                             ui.end_row();
                         });
@@ -3460,11 +3669,18 @@ impl SecureVaultApp {
                         ui.add_space(6.0);
                         ui.checkbox(&mut self.show_password, "显示明文密码");
                         ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("💡 提示：密码支持中文字符、字母、数字及特殊符号。采用零知识高强加密，无密码找回机制，请务必妥善保管并牢记密码！")
-                                .size(11.5)
-                                .color(egui::Color32::from_rgb(255, 215, 130)),
-                        );
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(36, 28, 12))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 120, 20)))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("💡 密码安全提示：密码支持中文字符、字母、数字及各类特殊符号。采用零知识高强物理级原地加密，无后门与密码找回机制，请务必妥善记录并牢记密码！")
+                                        .size(11.5)
+                                        .color(egui::Color32::from_rgb(255, 220, 140)),
+                                );
+                            });
                         ui.add_space(10.0);
 
                         if primary_action_button(
@@ -3608,7 +3824,12 @@ impl SecureVaultApp {
                         |ui| {
                             ui.add_enabled(
                                 !self.is_exit_encrypting,
-                                bordered_text_edit(&mut self.exit_password, !self.exit_show_password, 220.0),
+                                bordered_text_edit(
+                                    &mut self.exit_password,
+                                    !self.exit_show_password,
+                                    220.0,
+                                    "请输入统一加密密钥 (支持中文)",
+                                ),
                             );
                             ui.add_space(4.0);
                             if icon_text_button(
@@ -3639,7 +3860,12 @@ impl SecureVaultApp {
                     ui.label(egui::RichText::new("确认新密钥:").size(13.0));
                     ui.add_enabled(
                         !self.is_exit_encrypting,
-                        bordered_text_edit(&mut self.exit_confirm_password, !self.exit_show_password, 220.0),
+                        bordered_text_edit(
+                            &mut self.exit_confirm_password,
+                            !self.exit_show_password,
+                            220.0,
+                            "请再次输入密钥以确认",
+                        ),
                     );
                     ui.end_row();
                 });
@@ -3647,11 +3873,18 @@ impl SecureVaultApp {
                 ui.add_space(6.0);
                 ui.checkbox(&mut self.exit_show_password, "显示明文密码");
                 ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("💡 提示：将为所有明文文件夹统一设置此加密密钥（支持中文）。采用零知识加密，无找回机制，请妥善记录！")
-                        .size(11.5)
-                        .color(egui::Color32::from_rgb(255, 215, 130)),
-                );
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(36, 28, 12))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 120, 20)))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("💡 退出加密提示：将为所有明文文件夹统一设置此加密密钥（支持中文密码）。采用零知识原地加密，无密码找回机制，请务必妥善记录！")
+                                .size(11.5)
+                                .color(egui::Color32::from_rgb(255, 220, 140)),
+                        );
+                    });
 
                 if let Some(err) = &self.exit_error {
                     ui.add_space(6.0);
@@ -3779,17 +4012,32 @@ impl SecureVaultApp {
         ui.add_space(10.0);
         egui::Grid::new("append_grid").num_columns(2).spacing([12.0, 12.0]).show(ui, |ui| {
             ui.label(egui::RichText::new("输入原密码:").size(13.0));
-            ui.add_enabled(!self.is_busy, bordered_text_edit(&mut self.password, !self.show_password, 260.0));
+            ui.add_enabled(
+                !self.is_busy,
+                bordered_text_edit(
+                    &mut self.password,
+                    !self.show_password,
+                    260.0,
+                    "请输入该保险箱原加密密码 (支持中文)",
+                ),
+            );
             ui.end_row();
         });
         ui.add_space(6.0);
         ui.add_enabled(!self.is_busy, egui::Checkbox::new(&mut self.show_password, "显示明文密码"));
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("💡 提示：请输入该保险箱原加密密码（支持中文输入）。验证通过后仅对本次新增的文件与目录执行原地加密。")
-                .size(11.5)
-                .color(egui::Color32::from_rgb(175, 205, 235)),
-        );
+        egui::Frame::default()
+            .fill(egui::Color32::from_rgb(18, 28, 44))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 85, 140)))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("💡 增量加密提示：请输入该保险箱原加密密码（支持中文输入）。验证通过后仅对本次新增的文件与目录执行原地加密。")
+                        .size(11.5)
+                        .color(egui::Color32::from_rgb(190, 220, 255)),
+                );
+            });
         ui.add_space(10.0);
         if primary_action_button(ui, !self.is_busy, "🔒", "继续加密", egui::Color32::from_rgb(16, 149, 90)).clicked() {
             if self.password.is_empty() {
@@ -4029,7 +4277,12 @@ impl SecureVaultApp {
                         egui::vec2(ui.available_width(), 32.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            ui.add(bordered_text_edit(&mut batch.password, !batch.show_password, 220.0));
+                            let hint = if is_encrypt {
+                                "请输入统一加密密钥 (支持中文)"
+                            } else {
+                                "请输入批量解密密钥 (支持中文)"
+                            };
+                            ui.add(bordered_text_edit(&mut batch.password, !batch.show_password, 220.0, hint));
                             if is_encrypt {
                                 ui.add_space(4.0);
                                 if icon_text_button(
@@ -4059,7 +4312,7 @@ impl SecureVaultApp {
 
                     if is_encrypt {
                         ui.label(egui::RichText::new("确认新密钥:").size(12.5));
-                        ui.add(bordered_text_edit(&mut batch.confirm_password, !batch.show_password, 220.0));
+                        ui.add(bordered_text_edit(&mut batch.confirm_password, !batch.show_password, 220.0, "请再次输入密钥以确认"));
                         ui.end_row();
                     }
                 });
@@ -4068,17 +4321,31 @@ impl SecureVaultApp {
                 ui.checkbox(&mut batch.show_password, "显示明文密码");
                 ui.add_space(4.0);
                 if is_encrypt {
-                    ui.label(
-                        egui::RichText::new("💡 提示：所选的全部文件夹将统一使用此密码加密（支持中文）。采用零知识保护，无找回机制，请务必牢记！")
-                            .size(11.5)
-                            .color(egui::Color32::from_rgb(255, 215, 130)),
-                    );
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(36, 28, 12))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 120, 20)))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("💡 批量加密提示：所选的全部文件夹将统一使用此密码原地加密锁定（支持中文）。采用零知识保护，无找回机制，请务必牢记！")
+                                    .size(11.5)
+                                    .color(egui::Color32::from_rgb(255, 220, 140)),
+                            );
+                        });
                 } else {
-                    ui.label(
-                        egui::RichText::new("💡 提示：将使用此密码尝试对所选保险箱批量解密还原（支持中文）。若密码不匹配则会自动跳过，不影响数据安全。")
-                            .size(11.5)
-                            .color(egui::Color32::from_rgb(175, 205, 235)),
-                    );
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(18, 28, 44))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 85, 140)))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("💡 批量解密提示：将使用此密码尝试对所选保险箱批量解密还原（支持中文）。若密码不匹配则会自动跳过，不影响数据安全。")
+                                    .size(11.5)
+                                    .color(egui::Color32::from_rgb(190, 220, 255)),
+                            );
+                        });
                 }
 
                 if let Some(err) = &batch.error {
