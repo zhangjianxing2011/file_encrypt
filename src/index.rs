@@ -14,7 +14,7 @@ pub const VAULT_META_BACKUP_FILE: &str = ".vault_meta.bak";
 /// Top-level vault metadata. Stored as plaintext JSON so that we can
 /// read the salt and password check without knowing the password.
 /// The actual file index is encrypted inside `encrypted_index`.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VaultMeta {
     /// Format version (currently 1)
     pub version: u32,
@@ -26,6 +26,9 @@ pub struct VaultMeta {
     pub chunk_size: u32,
     /// Base64-encoded encrypted index: nonce(12) || ciphertext || tag(16)
     pub encrypted_index: String,
+    /// Optional password hint to help remember the password
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_hint: Option<String>,
 }
 
 // ─── Encrypted index payload ────────────────────────────────────────

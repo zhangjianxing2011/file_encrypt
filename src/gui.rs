@@ -89,6 +89,7 @@ pub struct BatchDialogState {
     pub selected_paths: HashSet<PathBuf>,
     pub password: String,
     pub confirm_password: String,
+    pub password_hint: String,
     pub show_password: bool,
     pub error: Option<String>,
 }
@@ -119,6 +120,7 @@ pub struct VaultInspection {
     pub total_plain_bytes: u64,
     pub total_plain_files: usize,
     pub total_plain_dirs: usize,
+    pub password_hint: Option<String>,
 }
 
 pub struct SecureVaultApp {
@@ -138,6 +140,7 @@ pub struct SecureVaultApp {
     // Passwords for right panel operations
     password: String,
     confirm_password: String,
+    password_hint: String,
     show_password: bool,
 
     // Async worker feedback
@@ -162,6 +165,7 @@ pub struct SecureVaultApp {
     bypass_exit_check: bool,
     exit_password: String,
     exit_confirm_password: String,
+    exit_password_hint: String,
     exit_show_password: bool,
     exit_error: Option<String>,
     is_exit_encrypting: bool,
@@ -1069,6 +1073,7 @@ fn inspect_vault(path: &Path) -> VaultInspection {
             total_plain_bytes: 0,
             total_plain_files: 0,
             total_plain_dirs: 0,
+            password_hint: None,
         };
     }
 
@@ -1077,6 +1082,7 @@ fn inspect_vault(path: &Path) -> VaultInspection {
     let mut total_encrypted_bytes = 0;
 
     if locked {
+        let password_hint = vault::read_vault_meta(path).ok().and_then(|(m, _)| m.password_hint);
         let data_dir = path.join(".vault_data");
         if let Ok(entries) = std::fs::read_dir(&data_dir) {
             for entry in entries.flatten() {
@@ -1099,6 +1105,7 @@ fn inspect_vault(path: &Path) -> VaultInspection {
             total_plain_bytes: 0,
             total_plain_files: 0,
             total_plain_dirs: 0,
+            password_hint,
         }
     } else {
         let plain_tree = scan_plain_dir_tree(path);
@@ -1113,6 +1120,7 @@ fn inspect_vault(path: &Path) -> VaultInspection {
             total_plain_bytes,
             total_plain_files,
             total_plain_dirs,
+            password_hint: None,
         }
     }
 }
@@ -1404,6 +1412,7 @@ impl SecureVaultApp {
             active_tab,
             password: String::new(),
             confirm_password: String::new(),
+            password_hint: String::new(),
             show_password: false,
             is_busy: false,
             status_message: None,
@@ -1418,6 +1427,7 @@ impl SecureVaultApp {
             bypass_exit_check: false,
             exit_password: String::new(),
             exit_confirm_password: String::new(),
+            exit_password_hint: String::new(),
             exit_show_password: false,
             exit_error: None,
             is_exit_encrypting: false,
@@ -1461,6 +1471,7 @@ impl SecureVaultApp {
         self.status_message = None;
         self.password.clear();
         self.confirm_password.clear();
+        self.password_hint.clear();
         self.refresh_current_inspection();
     }
 
@@ -3062,6 +3073,13 @@ impl SecureVaultApp {
                                         bordered_text_edit(&mut self.confirm_password, !self.show_password, 260.0, "请再次输入密码以确认"),
                                     );
                                     ui.end_row();
+
+                                    ui.label(egui::RichText::new("密码提示 (选填):").size(13.0));
+                                    ui.add_enabled(
+                                        !self.is_busy,
+                                        bordered_text_edit(&mut self.password_hint, false, 260.0, "用于帮自己回忆密码，如：老家门牌号"),
+                                    );
+                                    ui.end_row();
                                 });
 
                                 ui.add_space(6.0);
@@ -3146,6 +3164,40 @@ impl SecureVaultApp {
                                     .color(egui::Color32::from_rgb(210, 225, 245)),
                                 );
                                 ui.add_space(10.0);
+
+                                if let Some(hint) = self
+                                    .inspection
+                                    .as_ref()
+                                    .and_then(|i| i.password_hint.as_deref())
+                                    .filter(|h| !h.trim().is_empty())
+                                {
+                                    egui::Frame::default()
+                                        .fill(egui::Color32::from_rgb(18, 38, 62))
+                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246)))
+                                        .corner_radius(egui::CornerRadius::same(6))
+                                        .inner_margin(egui::Margin::symmetric(12, 8))
+                                        .show(ui, |ui| {
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(ui.available_width(), 20.0),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("💡 密码提示：")
+                                                            .size(13.0)
+                                                            .strong()
+                                                            .color(egui::Color32::from_rgb(147, 197, 253)),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(hint)
+                                                            .size(13.0)
+                                                            .strong()
+                                                            .color(egui::Color32::WHITE),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    ui.add_space(8.0);
+                                }
 
                                 egui::Grid::new("unlock_grid").num_columns(2).spacing([12.0, 12.0]).show(ui, |ui| {
                                     ui.label(egui::RichText::new("输入解密密码:").size(13.0));
@@ -3516,6 +3568,40 @@ impl SecureVaultApp {
                         );
                         ui.add_space(10.0);
 
+                        if let Some(hint) = self
+                            .inspection
+                            .as_ref()
+                            .and_then(|i| i.password_hint.as_deref())
+                            .filter(|h| !h.trim().is_empty())
+                        {
+                            egui::Frame::default()
+                                .fill(egui::Color32::from_rgb(18, 38, 62))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246)))
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::symmetric(12, 8))
+                                .show(ui, |ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(ui.available_width(), 20.0),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new("💡 所属保险箱密码提示：")
+                                                    .size(13.0)
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(147, 197, 253)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(hint)
+                                                    .size(13.0)
+                                                    .strong()
+                                                    .color(egui::Color32::WHITE),
+                                            );
+                                        },
+                                    );
+                                });
+                            ui.add_space(8.0);
+                        }
+
                         egui::Grid::new("file_unlock_grid").num_columns(2).spacing([12.0, 12.0]).show(ui, |ui| {
                             ui.label(egui::RichText::new("输入解密密码:").size(13.0));
                             ui.add_enabled(
@@ -3661,6 +3747,18 @@ impl SecureVaultApp {
                                     !self.show_password,
                                     260.0,
                                     "请再次输入密码以确认",
+                                ),
+                            );
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new("密码提示 (选填):").size(13.0));
+                            ui.add_enabled(
+                                !self.is_busy,
+                                bordered_text_edit(
+                                    &mut self.password_hint,
+                                    false,
+                                    260.0,
+                                    "用于帮自己回忆密码，如：老家门牌号",
                                 ),
                             );
                             ui.end_row();
@@ -3865,6 +3963,18 @@ impl SecureVaultApp {
                             !self.exit_show_password,
                             220.0,
                             "请再次输入密钥以确认",
+                        ),
+                    );
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("密码提示 (选填):").size(13.0));
+                    ui.add_enabled(
+                        !self.is_exit_encrypting,
+                        bordered_text_edit(
+                            &mut self.exit_password_hint,
+                            false,
+                            220.0,
+                            "如：统一备忘线索",
                         ),
                     );
                     ui.end_row();
@@ -4107,6 +4217,7 @@ impl SecureVaultApp {
             selected_paths: selected,
             password: String::new(),
             confirm_password: String::new(),
+            password_hint: String::new(),
             show_password: false,
             error: None,
         });
@@ -4138,7 +4249,7 @@ impl SecureVaultApp {
             .collect();
 
         let mut close_dialog = false;
-        let mut start_task_args: Option<(BatchMode, Vec<TrackedVault>, String)> = None;
+        let mut start_task_args: Option<(BatchMode, Vec<TrackedVault>, String, String)> = None;
 
         egui::Window::new(title)
             .collapsible(false)
@@ -4271,6 +4382,44 @@ impl SecureVaultApp {
                 ui.label(egui::RichText::new(pwd_label).size(12.5).strong().color(egui::Color32::from_rgb(220, 235, 255)));
                 ui.add_space(6.0);
 
+                if !is_encrypt {
+                    let mut hint_lines = Vec::new();
+                    for p in &batch.selected_paths {
+                        if let Ok((m, _)) = vault::read_vault_meta(p) {
+                            if let Some(h) = m.password_hint.filter(|h| !h.trim().is_empty()) {
+                                let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "文件夹".into());
+                                hint_lines.push((name, h));
+                            }
+                        }
+                    }
+                    if !hint_lines.is_empty() {
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(18, 38, 62))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246)))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                for (name, hint) in hint_lines {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("💡 【{}】密码提示:", name))
+                                                .size(12.0)
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(147, 197, 253)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(hint)
+                                                .size(12.0)
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                        );
+                                    });
+                                }
+                            });
+                        ui.add_space(8.0);
+                    }
+                }
+
                 egui::Grid::new("batch_pw_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
                     ui.label(egui::RichText::new(if is_encrypt { "设置新密钥:" } else { "输入密钥:" }).size(12.5));
                     ui.allocate_ui_with_layout(
@@ -4313,6 +4462,10 @@ impl SecureVaultApp {
                     if is_encrypt {
                         ui.label(egui::RichText::new("确认新密钥:").size(12.5));
                         ui.add(bordered_text_edit(&mut batch.confirm_password, !batch.show_password, 220.0, "请再次输入密钥以确认"));
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("密码提示 (选填):").size(12.5));
+                        ui.add(bordered_text_edit(&mut batch.password_hint, false, 220.0, "如：统一备忘线索"));
                         ui.end_row();
                     }
                 });
@@ -4392,7 +4545,7 @@ impl SecureVaultApp {
                                     .filter(|v| batch.selected_paths.contains(&v.path))
                                     .cloned()
                                     .collect();
-                                start_task_args = Some((batch.mode, selected_vaults, batch.password.clone()));
+                                start_task_args = Some((batch.mode, selected_vaults, batch.password.clone(), batch.password_hint.clone()));
                                 close_dialog = true;
                             }
                         }
@@ -4426,8 +4579,8 @@ impl SecureVaultApp {
             self.batch_dialog = Some(batch);
         }
 
-        if let Some((mode, vaults, pwd)) = start_task_args {
-            self.start_batch_task(mode, vaults, pwd);
+        if let Some((mode, vaults, pwd, hint)) = start_task_args {
+            self.start_batch_task(mode, vaults, pwd, hint);
         }
     }
 
@@ -4708,6 +4861,7 @@ impl SecureVaultApp {
         let path = path.to_path_buf();
         let password = std::mem::take(&mut self.password);
         self.confirm_password.clear();
+        let hint = std::mem::take(&mut self.password_hint);
         let tx = self.tx.clone();
 
         self.is_busy = true;
@@ -4735,7 +4889,8 @@ impl SecureVaultApp {
             let tx_prog = tx_mutex.clone();
             let folder_prog = target_path.clone();
 
-            let res = vault::lock_with_progress(&target_path, &password, move |completed, total, current_file, file_size| {
+            let hint_opt = if hint.trim().is_empty() { None } else { Some(hint.as_str()) };
+            let res = vault::lock_with_hint_and_progress(&target_path, &password, hint_opt, move |completed, total, current_file, file_size| {
                 if let Ok(tx) = tx_prog.lock() {
                     let _ = tx.send(VaultTaskMsg::EncryptProgress(EncryptProgressInfo {
                         folder: folder_prog.clone(),
@@ -4848,7 +5003,7 @@ impl SecureVaultApp {
         });
     }
 
-    fn start_batch_task(&mut self, mode: BatchMode, folders: Vec<TrackedVault>, password: String) {
+    fn start_batch_task(&mut self, mode: BatchMode, folders: Vec<TrackedVault>, password: String, hint: String) {
         self.is_busy = true;
         self.status_message = None;
         let is_encrypt = mode == BatchMode::Encrypt;
@@ -4898,7 +5053,8 @@ impl SecureVaultApp {
                 let f_path = folder_path.clone();
 
                 let res: Result<(), anyhow::Error> = if is_encrypt {
-                    vault::lock_with_progress(&folder_path, &password, move |completed, ftotal, file_path, file_size| {
+                    let hint_opt = if hint.trim().is_empty() { None } else { Some(hint.as_str()) };
+                    vault::lock_with_hint_and_progress(&folder_path, &password, hint_opt, move |completed, ftotal, file_path, file_size| {
                         if let Ok(tx) = tx_prog.lock() {
                             let _ = tx.send(VaultTaskMsg::BatchProgress(BatchProgressInfo {
                                 current_folder_index: idx,
@@ -4964,13 +5120,15 @@ impl SecureVaultApp {
     }
 
 
-    fn start_exit_encrypt_task(&self, folders: Vec<PathBuf>, mut password: String) {
+    fn start_exit_encrypt_task(&mut self, folders: Vec<PathBuf>, mut password: String) {
+        let hint = std::mem::take(&mut self.exit_password_hint);
         let tx = self.tx.clone();
         thread::spawn(move || {
             use zeroize::Zeroize;
+            let hint_opt = if hint.trim().is_empty() { None } else { Some(hint.as_str()) };
             for folder in folders {
                 if folder.exists() && !vault::is_locked(&folder) {
-                    if let Err(e) = vault::lock(&folder, &password) {
+                    if let Err(e) = vault::lock_with_hint_and_progress(&folder, &password, hint_opt, |_, _, _, _| {}) {
                         password.zeroize();
                         let _ = tx.send(VaultTaskMsg::ExitEncryptComplete(Err(format!(
                             "加密 {} 失败: {}",

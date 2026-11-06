@@ -96,14 +96,29 @@ fn check_file_writable(path: &Path) -> Result<(), std::io::Error> {
 /// 4. Writes encrypted index → .vault_meta
 /// 5. Safely overwrites and deletes original files with bounded concurrency
 /// 6. Reuses scanned directory structure to eliminate duplicate filesystem walks
+#[allow(dead_code)]
 pub fn lock(folder: &Path, password: &str) -> Result<LockReport> {
-    lock_with_progress(folder, password, |_, _, _, _| {})
+    lock_with_hint_and_progress(folder, password, None, |_, _, _, _| {})
 }
 
 /// Encrypt and lock a folder in-place with real-time per-file progress callback.
 ///
 /// Progress callback receives: `(completed_files, total_files, current_relative_path, file_size)`
+#[allow(dead_code)]
 pub fn lock_with_progress<F>(folder: &Path, password: &str, progress: F) -> Result<LockReport>
+where
+    F: Fn(usize, usize, &str, u64) + Send + Sync,
+{
+    lock_with_hint_and_progress(folder, password, None, progress)
+}
+
+/// Encrypt and lock a folder in-place with optional password hint and progress callback.
+pub fn lock_with_hint_and_progress<F>(
+    folder: &Path,
+    password: &str,
+    hint: Option<&str>,
+    progress: F,
+) -> Result<LockReport>
 where
     F: Fn(usize, usize, &str, u64) + Send + Sync,
 {
@@ -249,12 +264,22 @@ where
     let encrypted_index = crypto.encrypt_index(&index_json)?;
 
     // ── 6. Write vault metadata ─────────────────────────────────
+    let password_hint = hint.and_then(|h| {
+        let trimmed = h.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
     let meta = VaultMeta {
         version: 1,
         salt: BASE64.encode(&salt),
         password_check: BASE64.encode(crypto.password_check()),
         chunk_size: DEFAULT_CHUNK_SIZE as u32,
         encrypted_index: BASE64.encode(&encrypted_index),
+        password_hint,
     };
     let meta_json = serde_json::to_string_pretty(&meta)?;
     fs::write(folder.join(VAULT_META_FILE), &meta_json)?;
@@ -537,6 +562,7 @@ where
                 password_check: meta.password_check.clone(),
                 chunk_size: meta.chunk_size,
                 encrypted_index: BASE64.encode(&updated_encrypted),
+                password_hint: meta.password_hint.clone(),
             };
             let updated_meta_json = serde_json::to_string_pretty(&updated_meta)?;
             fs::write(&meta_path, &updated_meta_json)?;
@@ -1269,6 +1295,41 @@ mod tests {
             let report = append(&dir, password).unwrap();
             assert!(report.is_complete());
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_password_hint_roundtrip_and_backward_compatibility() {
+        let dir = setup_test_folder("password_hint");
+        create_test_file(&dir, "note.txt", b"secret info");
+        let pwd = "MyStrongPassword@123";
+        let hint = "My hometown street + birthday";
+
+        // Lock with hint
+        let report = lock_with_hint_and_progress(&dir, pwd, Some(hint), |_, _, _, _| {}).unwrap();
+        assert!(report.is_complete());
+        assert!(is_locked(&dir));
+
+        // Read vault metadata and verify hint is saved and retrievable
+        let (meta, _) = read_vault_meta(&dir).unwrap();
+        assert_eq!(meta.password_hint.as_deref(), Some(hint));
+
+        // Unlock and verify file restored
+        let un_report = unlock(&dir, pwd).unwrap();
+        assert!(un_report.is_complete());
+        assert_eq!(fs::read(dir.join("note.txt")).unwrap(), b"secret info");
+
+        // Verify backward compatibility: simulate older metadata JSON without password_hint
+        let legacy_json = r#"{
+            "version": 1,
+            "salt": "dGVzdHNhbHQ=",
+            "password_check": "dGVzdGNoZWNr",
+            "chunk_size": 4194304,
+            "encrypted_index": "dGVzdGluZGV4"
+        }"#;
+        let legacy_meta: VaultMeta = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_meta.password_hint, None);
 
         let _ = fs::remove_dir_all(&dir);
     }

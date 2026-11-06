@@ -38,6 +38,9 @@ enum Commands {
         /// Optional password passed via flag (e.g. for automation/testing)
         #[arg(short, long)]
         password: Option<String>,
+        /// Optional password hint to help remember password
+        #[arg(long)]
+        hint: Option<String>,
     },
     /// Decrypt and unlock a locked folder (requires password)
     Unlock {
@@ -69,7 +72,7 @@ fn main() -> Result<()> {
         None | Some(Commands::Gui) => {
             launch_gui()?;
         }
-        Some(Commands::Lock { path, password }) => {
+        Some(Commands::Lock { path, password, hint }) => {
             let pwd = match password {
                 Some(p) => {
                     if p.is_empty() {
@@ -79,7 +82,7 @@ fn main() -> Result<()> {
                 }
                 None => prompt_new_password()?,
             };
-            let report = vault::lock(&path, &pwd)?;
+            let report = vault::lock_with_hint_and_progress(&path, &pwd, hint.as_deref(), |_, _, _, _| {})?;
             if !report.is_complete() {
                 eprintln!(
                     "⚠️  {} file(s) were skipped (in use or locked by another program):",
@@ -95,6 +98,13 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::Unlock { path, password }) => {
+            if let Ok((meta, _)) = vault::read_vault_meta(&path) {
+                if let Some(h) = &meta.password_hint {
+                    if !h.trim().is_empty() {
+                        println!("💡 密码提示: {}", h.trim());
+                    }
+                }
+            }
             let pwd = match password {
                 Some(p) => p,
                 None => prompt_password("Enter password: ")?,
