@@ -2,6 +2,7 @@ use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 
 use crate::vault;
@@ -131,9 +132,12 @@ pub struct SecureVaultApp {
     selected_path: PathBuf,
     selected_name: String,
     selected_is_dir: bool,
-    inspection: Option<VaultInspection>,
-    inspection_cache: HashMap<PathBuf, VaultInspection>,
+    inspection: Option<Arc<VaultInspection>>,
+    inspection_cache: HashMap<PathBuf, Arc<VaultInspection>>,
     expanded_folders: HashSet<PathBuf>, // Fold/collapse state for all folders (vaults, subfolders, .vault_data)
+
+    // Auto-refresh: last time inspection cache was refreshed (for periodic staleness detection)
+    last_cache_refresh: std::time::Instant,
 
     // Active Tab in right panel
     active_tab: ActiveTab,
@@ -1112,9 +1116,42 @@ fn collect_all_folder_paths(vaults: &[TrackedVault]) -> HashSet<PathBuf> {
     set
 }
 
-fn inspect_vault(path: &Path) -> VaultInspection {
+/// Fast in-memory check without any heap allocations to test if a vault and all its subfolders are expanded.
+fn is_vault_all_expanded(vault_path: &Path, insp: Option<&VaultInspection>, expanded: &HashSet<PathBuf>) -> bool {
+    if !expanded.contains(vault_path) {
+        return false;
+    }
+    if let Some(insp) = insp {
+        if !insp.exists {
+            return false;
+        }
+        if insp.is_locked {
+            let data_dir = vault_path.join(".vault_data");
+            return expanded.contains(&data_dir);
+        } else {
+            return is_plain_tree_all_expanded(&insp.plain_tree, expanded);
+        }
+    }
+    false
+}
+
+fn is_plain_tree_all_expanded(nodes: &[FileTreeNode], expanded: &HashSet<PathBuf>) -> bool {
+    for node in nodes {
+        if node.is_dir {
+            if !expanded.contains(&node.path) {
+                return false;
+            }
+            if !is_plain_tree_all_expanded(&node.children, expanded) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn inspect_vault(path: &Path) -> Arc<VaultInspection> {
     if !path.exists() || !path.is_dir() {
-        return VaultInspection {
+        return Arc::new(VaultInspection {
             is_locked: false,
             exists: false,
             encrypted_files: Vec::new(),
@@ -1124,7 +1161,7 @@ fn inspect_vault(path: &Path) -> VaultInspection {
             total_plain_files: 0,
             total_plain_dirs: 0,
             password_hint: None,
-        };
+        });
     }
 
     let locked = vault::is_locked(path);
@@ -1146,7 +1183,7 @@ fn inspect_vault(path: &Path) -> VaultInspection {
                 }
             }
         }
-        VaultInspection {
+        Arc::new(VaultInspection {
             is_locked: true,
             exists: true,
             encrypted_files,
@@ -1156,12 +1193,12 @@ fn inspect_vault(path: &Path) -> VaultInspection {
             total_plain_files: 0,
             total_plain_dirs: 0,
             password_hint,
-        }
+        })
     } else {
         let plain_tree = scan_plain_dir_tree(path);
         let total_plain_bytes = sum_tree_size(&plain_tree);
         let (total_plain_files, total_plain_dirs) = count_tree_items(&plain_tree);
-        VaultInspection {
+        Arc::new(VaultInspection {
             is_locked: false,
             exists: true,
             encrypted_files: Vec::new(),
@@ -1171,7 +1208,7 @@ fn inspect_vault(path: &Path) -> VaultInspection {
             total_plain_files,
             total_plain_dirs,
             password_hint: None,
-        }
+        })
     }
 }
 
@@ -1199,7 +1236,28 @@ fn add_smart_size_label(ui: &mut egui::Ui, size_bytes: u64, color: egui::Color32
     );
 }
 
-/// Recursive renderer for folder and file tree nodes with expand/collapse and selection support
+/// Count visible (on-screen) tree nodes for pre-allocation (includes expanded children)
+fn count_visible_nodes(
+    nodes: &[FileTreeNode],
+    expanded_folders: &HashSet<PathBuf>,
+) -> usize {
+    let mut count = 0;
+    for node in nodes {
+        count += 1;
+        if node.is_dir && expanded_folders.contains(&node.path) {
+            if node.children.is_empty() {
+                count += 1; // "(空文件夹)" placeholder
+            } else {
+                count += count_visible_nodes(&node.children, expanded_folders);
+            }
+        }
+    }
+    count
+}
+
+/// Recursive renderer for folder and file tree nodes with expand/collapse and selection support.
+/// Uses viewport culling: nodes outside the visible scroll area only allocate empty space
+/// instead of creating full UI widgets, dramatically improving performance for large trees.
 fn render_file_tree(
     ui: &mut egui::Ui,
     nodes: &[FileTreeNode],
@@ -1209,109 +1267,151 @@ fn render_file_tree(
     current_selected_path: &Path,
     depth: usize,
 ) {
+    // Get the visible viewport for culling off-screen items
+    let clip_rect = ui.clip_rect();
+
     for node in nodes {
         if node.is_dir {
+            // Skip directory if it was deleted on disk externally
+            if !node.path.exists() {
+                continue;
+            }
+
             let is_expanded = expanded_folders.contains(&node.path);
             let is_this_selected = current_selected_path == node.path;
 
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    if depth > 0 {
-                        ui.add_space((depth as f32) * 12.0);
+            // Calculate the position this row will occupy
+            let row_top = ui.cursor().min.y;
+            let row_height = 22.0;
+
+            // Viewport culling: if this row is entirely below the viewport, skip detailed rendering
+            // but still allocate space (for correct layout)
+            if row_top > clip_rect.max.y + 200.0 {
+                // Far below viewport: allocate space for this node and all its visible descendants
+                let descendant_count = if is_expanded {
+                    if node.children.is_empty() { 1 } else {
+                        count_visible_nodes(&node.children, expanded_folders)
                     }
+                } else { 0 };
+                let total_height = row_height + (descendant_count as f32) * row_height;
+                ui.allocate_space(egui::vec2(ui.available_width(), total_height));
+                continue;
+            }
 
-                    // 1. Subfolder arrow toggle button (18x18 square)
-                    let (arrow_rect, arrow_resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                    if arrow_resp.hovered() {
-                        ui.painter().rect_filled(arrow_rect, 3.0, egui::Color32::from_rgb(42, 54, 76));
-                    }
-                    let arrow_glyph = if is_expanded { "▼" } else { "▶" };
-                    let arrow_color = if arrow_resp.hovered() {
-                        egui::Color32::WHITE
-                    } else {
-                        egui::Color32::from_rgb(165, 180, 205)
-                    };
-                    ui.painter().text(
-                        arrow_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        arrow_glyph,
-                        egui::FontId::proportional(10.0),
-                        arrow_color,
-                    );
-                    if arrow_resp.on_hover_text("折叠/展开此子文件夹").clicked() {
-                        toggled_folders.push(node.path.clone());
-                    }
+            // Check if this row is above the viewport (already scrolled past)
+            let row_bottom = row_top + row_height;
+            let is_visible = row_bottom >= clip_rect.min.y - 50.0 && row_top <= clip_rect.max.y + 50.0;
 
-                    // 2. Folder icon and name clickable button
-                    let folder_locked = node.is_locked;
-                    let folder_icon = if folder_locked { "🔒" } else { "📁" };
+            if !is_visible {
+                // Above viewport or just barely off-screen: allocate space but skip detailed rendering
+                ui.allocate_space(egui::vec2(ui.available_width(), row_height));
+            } else {
+                // Visible: render full UI
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), row_height),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        if depth > 0 {
+                            ui.add_space((depth as f32) * 12.0);
+                        }
 
-                    let folder_btn = egui::Button::new(
-                        egui::RichText::new(format!("{}  {}", folder_icon, node.name))
-                            .size(11.5)
-                            .strong()
-                            .color(if is_this_selected {
-                                egui::Color32::WHITE
-                            } else if is_expanded {
-                                egui::Color32::from_rgb(225, 235, 255)
-                            } else {
-                                egui::Color32::from_rgb(190, 205, 230)
-                            }),
-                    )
-                    .fill(if is_this_selected {
-                        egui::Color32::from_rgb(37, 99, 235)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .stroke(if is_this_selected {
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(96, 165, 250))
-                    } else {
-                        egui::Stroke::NONE
-                    })
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .min_size(egui::vec2(0.0, 18.0));
+                        // 1. Subfolder arrow toggle button (18x18 square)
+                        let (arrow_rect, arrow_resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                        if arrow_resp.hovered() {
+                            ui.painter().rect_filled(arrow_rect, 3.0, egui::Color32::from_rgb(42, 54, 76));
+                        }
+                        let arrow_glyph = if is_expanded { "▼" } else { "▶" };
+                        let arrow_color = if arrow_resp.hovered() {
+                            egui::Color32::WHITE
+                        } else {
+                            egui::Color32::from_rgb(165, 180, 205)
+                        };
+                        ui.painter().text(
+                            arrow_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            arrow_glyph,
+                            egui::FontId::proportional(10.0),
+                            arrow_color,
+                        );
+                        if arrow_resp.on_hover_text("折叠/展开此子文件夹").clicked() {
+                            toggled_folders.push(node.path.clone());
+                        }
 
-                    let btn_resp = ui.add(folder_btn);
-                    if btn_resp.double_clicked() {
-                        open_in_file_manager(&node.path);
-                    }
-                    let folder_tooltip = format!(
-                        "{} 目录: {}\n大小: {}\n路径: {}\n\n💡 提示: 单击选中此目录，双击在文件管理器中打开",
-                        folder_icon,
-                        node.name,
-                        format_bytes(node.size),
-                        node.path.display()
-                    );
-                    if btn_resp.on_hover_text(folder_tooltip).clicked() {
-                        *selected_target = Some((node.path.clone(), node.name.clone(), true));
-                    }
+                        // 2. Folder icon and name clickable button
+                        let folder_locked = node.is_locked;
+                        let folder_icon = if folder_locked { "🔒" } else { "📁" };
 
-                    // 3. Child items count badge
-                    let child_count = node.children.len();
-                    ui.label(
-                        egui::RichText::new(format!("({}项)", child_count))
-                            .size(10.0)
-                            .color(egui::Color32::from_rgb(125, 140, 165)),
-                    );
+                        let folder_btn = egui::Button::new(
+                            egui::RichText::new(format!("{}  {}", folder_icon, node.name))
+                                .size(11.5)
+                                .strong()
+                                .color(if is_this_selected {
+                                    egui::Color32::WHITE
+                                } else if is_expanded {
+                                    egui::Color32::from_rgb(225, 235, 255)
+                                } else {
+                                    egui::Color32::from_rgb(190, 205, 230)
+                                }),
+                        )
+                        .fill(if is_this_selected {
+                            egui::Color32::from_rgb(37, 99, 235)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .stroke(if is_this_selected {
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(96, 165, 250))
+                        } else {
+                            egui::Stroke::NONE
+                        })
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .min_size(egui::vec2(0.0, 18.0));
 
-                    // 4. Folder size (smart aligned, never overlapping)
-                    add_smart_size_label(ui, node.size, egui::Color32::from_rgb(120, 135, 160));
-                },
-            );
+                        let btn_resp = ui.add(folder_btn);
+                        if btn_resp.double_clicked() {
+                            open_in_file_manager(&node.path);
+                        }
+                        let folder_tooltip = format!(
+                            "{} 目录: {}\n大小: {}\n路径: {}\n\n💡 提示: 单击选中此目录，双击在文件管理器中打开",
+                            folder_icon,
+                            node.name,
+                            format_bytes(node.size),
+                            node.path.display()
+                        );
+                        if btn_resp.on_hover_text(folder_tooltip).clicked() {
+                            *selected_target = Some((node.path.clone(), node.name.clone(), true));
+                        }
+
+                        // 3. Child items count badge
+                        let child_count = node.children.len();
+                        ui.label(
+                            egui::RichText::new(format!("({}项)", child_count))
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(125, 140, 165)),
+                        );
+
+                        // 4. Folder size (smart aligned, never overlapping)
+                        add_smart_size_label(ui, node.size, egui::Color32::from_rgb(120, 135, 160));
+                    },
+                );
+            }
 
             // If this subfolder is expanded, render its children recursively
             if is_expanded {
                 if node.children.is_empty() {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 18.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add_space(((depth + 1) as f32) * 12.0 + 18.0);
-                            ui.label(egui::RichText::new("(空文件夹)").size(10.0).weak());
-                        },
-                    );
+                    let empty_top = ui.cursor().min.y;
+                    let empty_visible = empty_top + 18.0 >= clip_rect.min.y - 50.0 && empty_top <= clip_rect.max.y + 50.0;
+                    if empty_visible {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 18.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(((depth + 1) as f32) * 12.0 + 18.0);
+                                ui.label(egui::RichText::new("(空文件夹)").size(10.0).weak());
+                            },
+                        );
+                    } else {
+                        ui.allocate_space(egui::vec2(ui.available_width(), 18.0));
+                    }
                 } else {
                     render_file_tree(
                         ui,
@@ -1326,68 +1426,84 @@ fn render_file_tree(
             }
         } else {
             // Leaf File entry
-            let is_this_selected = current_selected_path == node.path;
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), 20.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    if depth > 0 {
-                        ui.add_space((depth as f32) * 12.0);
-                    }
-                    ui.add_space(18.0); // Align with folder icon after arrow
+            let row_top = ui.cursor().min.y;
+            let row_height = 20.0;
 
-                    let file_icon = match node.path.extension().and_then(|s| s.to_str()).unwrap_or("") {
-                        "png" | "jpg" | "jpeg" | "gif" | "webp" => "🖼️",
-                        "mp3" | "wav" | "flac" | "aac" => "🎵",
-                        "mp4" | "mkv" | "avi" | "mov" => "🎬",
-                        "zip" | "tar" | "gz" | "7z" | "rar" => "📦",
-                        "txt" | "md" | "json" | "xml" | "toml" | "yaml" => "📝",
-                        "rs" | "py" | "js" | "ts" | "c" | "cpp" | "sh" | "bat" => "💻",
-                        "pdf" | "doc" | "docx" => "📄",
-                        _ => "📄",
-                    };
+            // Viewport culling for file entries
+            if row_top > clip_rect.max.y + 200.0 {
+                ui.allocate_space(egui::vec2(ui.available_width(), row_height));
+                continue;
+            }
 
-                    let file_btn = egui::Button::new(
-                        egui::RichText::new(format!("{}  {}", file_icon, node.name))
-                            .size(11.0)
-                            .color(if is_this_selected {
-                                egui::Color32::WHITE
-                            } else {
-                                egui::Color32::from_rgb(205, 220, 240)
-                            }),
-                    )
-                    .fill(if is_this_selected {
-                        egui::Color32::from_rgb(30, 58, 110)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .stroke(if is_this_selected {
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 100, 180))
-                    } else {
-                        egui::Stroke::NONE
-                    })
-                    .corner_radius(egui::CornerRadius::same(3))
-                    .min_size(egui::vec2(0.0, 18.0));
+            let row_bottom = row_top + row_height;
+            let is_visible = row_bottom >= clip_rect.min.y - 50.0 && row_top <= clip_rect.max.y + 50.0;
 
-                    let file_resp = ui.add(file_btn);
-                    if file_resp.double_clicked() {
-                        open_file_with_default_app(&node.path);
-                    }
-                    let file_tooltip = format!(
-                        "{} 文件: {}\n大小: {}\n路径: {}\n\n💡 提示: 单击选中查看详情，双击使用系统默认程序打开文件",
-                        file_icon,
-                        node.name,
-                        format_bytes(node.size),
-                        node.path.display()
-                    );
-                    if file_resp.on_hover_text(file_tooltip).clicked() {
-                        *selected_target = Some((node.path.clone(), node.name.clone(), false));
-                    }
+            if !is_visible {
+                ui.allocate_space(egui::vec2(ui.available_width(), row_height));
+            } else {
+                let is_this_selected = current_selected_path == node.path;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), row_height),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        if depth > 0 {
+                            ui.add_space((depth as f32) * 12.0);
+                        }
+                        ui.add_space(18.0); // Align with folder icon after arrow
 
-                    // File size (smart aligned, never overlapping)
-                    add_smart_size_label(ui, node.size, egui::Color32::from_rgb(120, 135, 160));
-                },
-            );
+                        let file_icon = match node.path.extension().and_then(|s| s.to_str()).unwrap_or("") {
+                            "png" | "jpg" | "jpeg" | "gif" | "webp" => "🖼️",
+                            "mp3" | "wav" | "flac" | "aac" => "🎵",
+                            "mp4" | "mkv" | "avi" | "mov" => "🎬",
+                            "zip" | "tar" | "gz" | "7z" | "rar" => "📦",
+                            "txt" | "md" | "json" | "xml" | "toml" | "yaml" => "📝",
+                            "rs" | "py" | "js" | "ts" | "c" | "cpp" | "sh" | "bat" => "💻",
+                            "pdf" | "doc" | "docx" => "📄",
+                            _ => "📄",
+                        };
+
+                        let file_btn = egui::Button::new(
+                            egui::RichText::new(format!("{}  {}", file_icon, node.name))
+                                .size(11.0)
+                                .color(if is_this_selected {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::from_rgb(205, 220, 240)
+                                }),
+                        )
+                        .fill(if is_this_selected {
+                            egui::Color32::from_rgb(30, 58, 110)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .stroke(if is_this_selected {
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 100, 180))
+                        } else {
+                            egui::Stroke::NONE
+                        })
+                        .corner_radius(egui::CornerRadius::same(3))
+                        .min_size(egui::vec2(0.0, 18.0));
+
+                        let file_resp = ui.add(file_btn);
+                        if file_resp.double_clicked() {
+                            open_file_with_default_app(&node.path);
+                        }
+                        let file_tooltip = format!(
+                            "{} 文件: {}\n大小: {}\n路径: {}\n\n💡 提示: 单击选中查看详情，双击使用系统默认程序打开文件",
+                            file_icon,
+                            node.name,
+                            format_bytes(node.size),
+                            node.path.display()
+                        );
+                        if file_resp.on_hover_text(file_tooltip).clicked() {
+                            *selected_target = Some((node.path.clone(), node.name.clone(), false));
+                        }
+
+                        // File size (smart aligned, never overlapping)
+                        add_smart_size_label(ui, node.size, egui::Color32::from_rgb(120, 135, 160));
+                    },
+                );
+            }
         }
     }
 }
@@ -1459,6 +1575,7 @@ impl SecureVaultApp {
             inspection,
             inspection_cache,
             expanded_folders,
+            last_cache_refresh: std::time::Instant::now(),
             active_tab,
             password: String::new(),
             confirm_password: String::new(),
@@ -1570,6 +1687,7 @@ impl SecureVaultApp {
                 self.inspection_cache.insert(v.path.clone(), inspect_vault(&v.path));
             }
         }
+        self.last_cache_refresh = std::time::Instant::now();
     }
 
     /// Retrieve all tracked folders that are currently decrypted / unencrypted
@@ -2008,6 +2126,44 @@ impl eframe::App for SecureVaultApp {
 
 impl SecureVaultApp {
     fn ui_left_sidebar(&mut self, ui: &mut egui::Ui) {
+        // Auto-refresh: periodically re-scan tracked vaults to detect external filesystem changes.
+        // Only runs when not busy with an encrypt/decrypt operation, at most every 3 seconds.
+        if !self.is_busy && self.last_cache_refresh.elapsed() >= std::time::Duration::from_secs(3) {
+            let mut cache_changed = false;
+            for v in &self.tracked_vaults {
+                let fresh = inspect_vault(&v.path);
+                let needs_update = if let Some(cached) = self.inspection_cache.get(&v.path) {
+                    // Quick check: compare existence, lock state, file counts, and sizes
+                    cached.exists != fresh.exists
+                        || cached.is_locked != fresh.is_locked
+                        || cached.total_plain_files != fresh.total_plain_files
+                        || cached.total_plain_dirs != fresh.total_plain_dirs
+                        || cached.total_plain_bytes != fresh.total_plain_bytes
+                        || cached.encrypted_files.len() != fresh.encrypted_files.len()
+                        || cached.total_encrypted_bytes != fresh.total_encrypted_bytes
+                } else {
+                    true
+                };
+                if needs_update {
+                    self.inspection_cache.insert(v.path.clone(), fresh);
+                    cache_changed = true;
+                }
+            }
+            if cache_changed {
+                // Also refresh the currently selected inspection if it belongs to a tracked vault
+                self.refresh_current_inspection();
+            }
+            self.last_cache_refresh = std::time::Instant::now();
+            // Schedule a repaint so the next auto-refresh fires on time
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(3));
+        } else if !self.is_busy {
+            // Ensure we wake up for the next refresh interval
+            let remaining = std::time::Duration::from_secs(3).saturating_sub(self.last_cache_refresh.elapsed());
+            if !remaining.is_zero() {
+                ui.ctx().request_repaint_after(remaining);
+            }
+        }
+
         ui.add_space(4.0);
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), 26.0),
@@ -2260,12 +2416,7 @@ impl SecureVaultApp {
                     let mut fold_all_hovered = false;
                     let mut header_bottom_y = 0.0f32;
 
-                    let vault_paths = if let Some(i) = &cached_insp {
-                        collect_vault_folder_paths_from_inspection(&vault_item.path, i)
-                    } else {
-                        collect_single_vault_folder_paths(&vault_item.path)
-                    };
-                    let is_vault_all_expanded = !vault_paths.is_empty() && vault_paths.iter().all(|p| self.expanded_folders.contains(p));
+                    let is_vault_all_expanded = is_vault_all_expanded(&vault_item.path, cached_insp.as_deref(), &self.expanded_folders);
 
                     let card_frame_resp = egui::Frame::default()
                         .fill(card_bg)
@@ -2565,10 +2716,15 @@ impl SecureVaultApp {
                                         );
                                         if fold_all_resp.on_hover_text(fold_all_tooltip).clicked() {
                                             fold_all_clicked = true;
-                                            if is_vault_all_expanded {
-                                                bulk_collapse_folders.extend(vault_paths.clone());
+                                            let vault_paths = if let Some(i) = &cached_insp {
+                                                collect_vault_folder_paths_from_inspection(&vault_item.path, i)
                                             } else {
-                                                bulk_expand_folders.extend(vault_paths.clone());
+                                                collect_single_vault_folder_paths(&vault_item.path)
+                                            };
+                                            if is_vault_all_expanded {
+                                                bulk_collapse_folders.extend(vault_paths);
+                                            } else {
+                                                bulk_expand_folders.extend(vault_paths);
                                             }
                                         }
                                     });
@@ -2697,12 +2853,25 @@ impl SecureVaultApp {
                                                         if insp.encrypted_files.is_empty() {
                                                             ui.label(egui::RichText::new("(空)").weak().size(10.5));
                                                         } else {
+                                                            let clip_rect = ui.clip_rect();
                                                             for (fname, fsize) in &insp.encrypted_files {
+                                                                let row_top = ui.cursor().min.y;
+                                                                let row_height = 20.0;
+                                                                if row_top > clip_rect.max.y + 100.0 {
+                                                                    ui.allocate_space(egui::vec2(ui.available_width(), row_height));
+                                                                    continue;
+                                                                }
+                                                                let row_bottom = row_top + row_height;
+                                                                if row_bottom < clip_rect.min.y - 50.0 {
+                                                                    ui.allocate_space(egui::vec2(ui.available_width(), row_height));
+                                                                    continue;
+                                                                }
+
                                                                 let enc_path = data_dir.join(fname);
                                                                 let is_enc_selected = self.selected_path == enc_path;
 
                                                                 ui.allocate_ui_with_layout(
-                                                                    egui::vec2(ui.available_width(), 20.0),
+                                                                    egui::vec2(ui.available_width(), row_height),
                                                                     egui::Layout::left_to_right(egui::Align::Center),
                                                                     |ui| {
                                                                         let enc_btn = egui::Button::new(
@@ -2762,8 +2931,7 @@ impl SecureVaultApp {
 
                                                         if insp.total_plain_dirs > 0 {
                                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                                let sub_paths: Vec<PathBuf> = vault_paths.iter().filter(|p| **p != vault_item.path).cloned().collect();
-                                                                let all_sub_expanded = !sub_paths.is_empty() && sub_paths.iter().all(|p| self.expanded_folders.contains(p));
+                                                                let all_sub_expanded = is_plain_tree_all_expanded(&insp.plain_tree, &self.expanded_folders);
                                                                 let (btn_icon, btn_text) = if all_sub_expanded {
                                                                     ("⊟", "全部折叠")
                                                                 } else {
@@ -2787,6 +2955,10 @@ impl SecureVaultApp {
                                                                 })
                                                                 .clicked()
                                                                 {
+                                                                    let sub_paths: Vec<PathBuf> = collect_vault_folder_paths_from_inspection(&vault_item.path, &insp)
+                                                                        .into_iter()
+                                                                        .filter(|p| *p != vault_item.path)
+                                                                        .collect();
                                                                     if all_sub_expanded {
                                                                         bulk_collapse_folders.extend(sub_paths);
                                                                     } else {
@@ -3172,7 +3344,12 @@ impl SecureVaultApp {
                         .clicked()
                         {
                             if let Some(pos) = self.tracked_vaults.iter().position(|v| v.path == vault.path) {
+                                // Clean up all associated state for the removed vault
                                 self.inspection_cache.remove(&vault.path);
+                                // Remove the vault path and all child paths from expanded_folders
+                                self.expanded_folders.retain(|p| !p.starts_with(&vault.path));
+                                // Remove from unlocked_during_session
+                                self.unlocked_during_session.remove(&vault.path);
                                 self.tracked_vaults.remove(pos);
                                 save_tracked_vaults(&self.tracked_vaults);
                                 if self.tracked_vaults.is_empty() {
@@ -3343,7 +3520,20 @@ impl SecureVaultApp {
                                     );
                                 }
                                 ui.add_space(8.0);
-                                render_status_pill(ui, is_locked);
+                                if !self.selected_path.exists() {
+                                    render_badge_pill(
+                                        ui,
+                                        "❌",
+                                        "路径不存在/已删除",
+                                        egui::Color32::from_rgb(46, 18, 22),
+                                        egui::Stroke::new(1.0, egui::Color32::from_rgb(239, 68, 68)),
+                                        egui::Color32::from_rgb(255, 210, 215),
+                                        24.0,
+                                        false,
+                                    );
+                                } else {
+                                    render_status_pill(ui, is_locked);
+                                }
                             },
                         );
 
@@ -3472,6 +3662,32 @@ impl SecureVaultApp {
                 .inner_margin(egui::Margin::symmetric(20, 16))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
+
+                    if !self.selected_path.exists() {
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(38, 16, 20))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 53, 69)))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(14, 12))
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("⚠️ 当前选中的文件夹在磁盘上已不存在")
+                                            .size(13.5)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(255, 200, 205)),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new("该文件夹可能已在外部文件管理器中被删除、重命名或移动。\n• 点击左上角 🔄 按钮可立即同步并刷新状态；\n• 在左侧列表中点击 🗑️ 图标可将其从管理列表中移除。")
+                                            .size(11.5)
+                                            .color(egui::Color32::from_rgb(200, 215, 235)),
+                                    );
+                                });
+                            });
+                        return;
+                    }
+
                     match self.active_tab {
                         ActiveTab::Lock => {
                             if is_locked {
@@ -5743,6 +5959,7 @@ mod tests {
             inspection: None,
             inspection_cache: HashMap::new(),
             expanded_folders: HashSet::new(),
+            last_cache_refresh: std::time::Instant::now(),
             active_tab: ActiveTab::Lock,
             password: String::new(),
             confirm_password: String::new(),
