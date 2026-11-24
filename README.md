@@ -1,6 +1,6 @@
 # SecureVault (跨平台文件夹安全锁 - 免安装绿色版)
 
-高性能跨平台（Windows & macOS）文件夹原地加密工具。基于 **Rust** 开发，结合 **Argon2id + HKDF + AES-256-GCM** 构建。支持原生图形界面（GUI）与命令行界面（CLI）。
+高性能跨平台（Windows, macOS & Linux / Ubuntu Desktop）文件夹原地加密工具。基于 **Rust** 开发，结合 **Argon2id + HKDF + AES-256-GCM** 构建。支持原生图形界面（GUI）与全功能命令行界面（CLI）。
 
 ---
 
@@ -9,30 +9,35 @@
 1. **完全免安装 / 绿色便携**：
    - **Windows**：单个 `.exe` 二进制文件，无注册表依赖，随拷随用。
    - **macOS**：提供绿色免安装的 `SecureVault.app` 应用程序包与 `.dmg` 拖拽镜像，支持解压即用。
+   - **Linux / Ubuntu Desktop**：提供绿色免安装 `.tar.gz` 压缩包与独立二进制，附带一键式 `install.sh` 快速集成桌面启动器图标与标准 XDG 菜单。
 2. **左侧管理面板与文件展示**：
-   - 左侧常驻受保护文件夹列表，自动持久化记录用户添加的保险箱。
+   - 左侧常驻受保护文件夹列表，跨平台自动持久化记录用户添加的保险箱（Windows `%APPDATA%`, macOS `~/Library/Application Support`, Linux `$XDG_CONFIG_HOME` 或 `~/.config`）。
    - **已加密状态**：展示 `.vault_data` 中的随机 UUID 密文数据块及加密大小，原始文件名和目录结构被强加密混淆，彻底防窥。
    - **解密明文状态**：展示文件夹内的真实文件清单、子目录结构及占用大小。
-3. **关闭时防遗漏重新加密提示（支持中文密钥）**：
+3. **全功能命令行（CLI）与批处理支持**：
+   - 支持批量加密（`lock`）、批量解密（`unlock`）、批量追加（`append`）与批量状态检测（`status`）。
+   - 提供保险箱元数据深度探查（`info` / `inspect`）与常驻管理列表操作（`list` / `vaults`, `add`, `remove`）。
+   - 在 Linux / SSH 无显示服务环境下无参数启动时自动优雅提示并展示 CLI 帮助，不抛出窗口崩溃。
+4. **关闭时防遗漏重新加密提示（支持中文密钥）**：
    - 监听窗口关闭事件，若检测到有处于“解密明文”状态的文件夹，自动弹出安全确认弹窗。
    - 用户可输入新的加密密钥（**完全支持中文字符、字母、数字、特殊符号**），一键重新加密后安全退出。
-   - 内置系统级中文字体回退加载，保证界面汉字与中文密码输入清晰显示，杜绝方框问号。
-4. **完全原地操作**：
+   - 内置全平台系统级中文字体回退加载（Windows: 微软雅黑/宋体；macOS: PingFang SC/苹方；Ubuntu/Linux: Noto Sans CJK/文泉驿），保证界面汉字与中文密码输入清晰显示，杜绝方框问号。
+5. **完全原地操作**：
    - 保持在原文件夹内操作，不依赖挂载额外虚拟盘符或卷轴。
    - 锁定状态下，原始文件和子目录结构全部被清空粉碎，只留加密混淆数据与密文索引。
-5. **安全防撞库 & 抗暴力破解**：
+6. **安全防撞库 & 抗暴力破解**：
    - **Argon2id**（内存硬度参数 64MB，3 次迭代，4 通道并行），强力抗击 GPU/ASIC 并行碰撞。
    - **HKDF-SHA256** 派生独立的索引密钥、数据块密钥与验证 HMAC。
    - **常数时间校验**，防止时间侧信道分析。
-6. **高性能流式加密与多线程并行**：
+7. **高性能流式加密与多线程并行**：
    - 使用 **Rayon** 线程池多线程并行处理文件。
    - 采用 1MB 流式分块并复用内存缓冲区，避免大文件内存暴增。
    - 原文件支持原地覆写安全粉碎（包含 fsync 物理落盘）。
    - 支持 CPU AES-NI 原生硬件加速。
-7. **完整性校验与解密故障自动回滚**：
+8. **完整性校验与解密故障自动回滚**：
    - 采用全文件 SHA-256 哈希与 AES-256-GCM 认证标签进行端到端双重完整性校验。
    - 解密过程中若检测到密文受损或非法篡改，自动触发安全回滚并清理已释放文件，严防明文碎片残留泄露。
-8. **继续加密新增文件**：
+9. **继续加密新增文件**：
    - 将新文件放入已锁定的文件夹后，使用原密码执行【继续加密】，仅加密本次新增文件，保留已有密文数据块。
    - 支持同步新增空目录。显示新增文件数量为 0 时，空目录仍可能已经同步。
    - 新放入的文件在执行成功前仍是明文，不会因为文件夹显示“已加密”而自动受到保护。
@@ -76,17 +81,18 @@
 
 ---
 
-## 操作系统版本支持说明 (Windows & macOS)
+## 操作系统版本支持说明 (Windows, macOS & Linux)
 
-| 运行模式 | 最低支持的 Windows 版本 | 架构要求 | 关键限制与底层依赖说明 |
+| 平台 / 运行模式 | 最低系统版本要求 | 架构要求 | 关键限制与底层依赖说明 |
 | :--- | :--- | :--- | :--- |
-| **图形界面（UI / GUI）** | **Windows 10**（64位，1607+）<br>或 **Windows Server 2016** 及以上 | **64 位 (x64)** | 内置基于 `eframe` + `wgpu` 的现代图形栈，强制依赖 **DirectX 12**、现代 Vulkan 与 DXGI 1.4+。<br>❌ *Windows 7 / 8 / 8.1 / Server 2012 R2 因缺少 DirectX 12 驱动支持，无法运行 GUI 版本。* |
-| **集成发布包（CLI 命令行模式）**<br>*(即下载的 `SecureVault-Windows-<版本号>-x64.exe`)* | **Windows 10**（64位）<br>或 **Windows Server 2016** 及以上 | **64 位 (x64)** | 默认提供的绿色单文件同时内置了图形栈符号及 Rust 1.78+ 运行时库，系统环境基线与 UI 版一致。 |
-| **独立纯命令行构建（Pure CLI）**<br>*(按需剥离 GUI 依赖单独编译)* | **Windows Server 2012 R2**（64位）<br>或 **Windows 8.1**（64位） | **64 位 (x64)** | 剥离图形渲染栈后，Argon2id、AES-256-GCM 等加密逻辑可向下兼容至 Server 2012 R2；需系统安装 **Universal C Runtime (KB2999226)** 补丁。<br>❌ *Windows 7 原生缺失 `ProcessPrng`、`WaitOnAddress` 等基础安全与并发 API，不予支持。* |
+| **Windows（GUI 图形界面）** | **Windows 10**（64位，1607+）<br>或 **Windows Server 2016** 及以上 | **64 位 (x64)** | 内置基于 `eframe` + `wgpu` 的现代图形栈，依赖 **DirectX 12**、现代 Vulkan 与 DXGI 1.4+。<br>❌ *Windows 7 / 8 / 8.1 / Server 2012 R2 因缺少 DirectX 12 驱动支持，无法运行 GUI 版本。* |
+| **macOS（GUI 图形界面）** | **macOS 11.0 (Big Sur)** 及更高版本 | **Apple Silicon (M1~M6 全系)** | 提供原生 `.app` 与 `.dmg` 镜像，已完成 Ad-hoc 签名与隔离优化。<br>❌ *不提供老旧 Intel x86_64 Mac 架构支持。* |
+| **Linux / Ubuntu Desktop（GUI 图形界面）** | **Ubuntu 20.04 / 22.04 / 24.04 LTS**<br>Debian 11/12, Fedora 36+, Arch Linux 等 | **64 位 (x64 / x86_64)** | 支持原生 **X11 与 Wayland**（GNOME, KDE 等桌面环境）；内置主流中文字体回退（Noto Sans CJK、文泉驿等）。依赖基础 GTK3/XCB 运行时环境。 |
+| **全平台命令行模式（CLI）** | 同各平台基线版本<br>*(Linux 支持无显示环境/Headless 模式)* | **64 位 (x64)** | 在 Linux / SSH 无显示服务环境下无参数启动时，自动友好提示并回退至 CLI 命令帮助，杜绝闪退崩溃。 |
 
 > [!NOTE]
 > * **32 位支持**：不支持任何 32 位（x86）系统。
-> * **macOS 兼容性**：仅支持 **Apple Silicon 架构（搭载 M1 / M2 / M3 / M4 / M5 / M6 等 M 系列全系芯片）** 的 Mac 设备，最低系统版本要求 **macOS 11.0 (Big Sur)** 或更高版本（不提供 Intel x86_64 架构支持）。
+> * **Linux / Ubuntu 依赖**：各主流发行版默认已预装所需基础库。若在极精简 Linux 环境中运行 GUI，只需安装常用库（如 `sudo apt install libgtk-3-0 libx11-6 libxcb-render0`）。
 
 ---
 
@@ -96,10 +102,45 @@ SecureVault 为**完全免安装的绿色便携软件**，不写注册表、不�
 
 ### Windows 用户使用方法
 1. **获取软件**：
-   * 下载单文件版 `SecureVault-Windows-<版本号>-x64.exe`（如 `SecureVault-Windows-1.0.5-x64.exe`），或下载并解压 `SecureVault-Windows-<版本号>-x64.zip`。
+   * 下载单文件版 `SecureVault-Windows-<版本号>-x64.exe`（如 `SecureVault-Windows-1.0.9-x64.exe`），或下载并解压 `SecureVault-Windows-<版本号>-x64.zip`。
 2. **运行使用**：
    * **图形界面**：直接双击 `SecureVault-Windows-<版本号>-x64.exe`（或重命名后的 `securevault.exe`）即可打开窗口。
    * **命令行使用**：在软件所在目录空白处按住 `Shift + 鼠标右键`，选择【在此处打开 PowerShell 窗口】或【在终端中打开】，直接输入 `.\SecureVault-Windows-<版本号>-x64.exe <命令>`（亦可将程序放入系统的 PATH 环境变量目录中简写为 `securevault`）。
+
+### Ubuntu / Linux Desktop 用户使用方法
+
+#### 1. 一键解压与系统级/用户级安装（推荐）
+1. 从 GitHub Releases 下载最新安装包 `SecureVault-Linux-<版本号>-x64.tar.gz`。
+2. 打开终端解压并进入目录：
+   ```bash
+   tar -xzf SecureVault-Linux-*.tar.gz
+   cd SecureVault-Linux-*-x64
+   ```
+3. 执行一键安装脚本（自动安装二进制、高清应用图标及桌面启动菜单项）：
+   ```bash
+   # 系统全局安装（面向所有用户，推荐）：
+   sudo ./install.sh
+
+   # 或当前用户安装（免 sudo 权限，安装至 ~/.local/bin）：
+   ./install.sh
+   ```
+4. **启动使用**：
+   - **桌面启动**：在 Ubuntu 应用程序启动器（按 Super/Win 键）中搜索 **“SecureVault”** 或 **“文件保险箱”**，点击即可打开原生图形界面。
+   - **终端运行**：直接在任意终端中执行 `securevault --help` 或 `securevault gui`。
+
+#### 2. 免安装绿色便携运行（直接运行）
+若无需集成桌面图标，可直接解压后运行文件夹内的可执行文件：
+```bash
+./securevault gui              # 启动图形界面
+./securevault lock /path/dir   # 命令行加密
+```
+亦可直接下载单文件独立二进制 `SecureVault-Linux-<版本号>-x64`：
+```bash
+chmod +x SecureVault-Linux-*-x64
+./SecureVault-Linux-*-x64 --help
+```
+
+---
 
 ### macOS 用户使用方法与安装问题解决
 
@@ -166,82 +207,132 @@ SecureVault 为**完全免安装的绿色便携软件**，不写注册表、不�
 
 ## 命令行（CLI）指令速查
 
-在 Windows 控制台（CMD / PowerShell）中，可直接执行 `.\securevault.exe <命令>`（或加入系统环境变量后执行 `securevault <命令>`）。
+SecureVault 在 Windows、macOS 与 Linux / Ubuntu 终端中均提供一致的全功能命令行体验：
+- **Windows**：在 PowerShell / CMD 中执行 `.\securevault.exe <命令>`（或配置 PATH 后直接 `securevault <命令>`）。
+- **macOS / Linux**：在 Terminal 中执行 `securevault <命令>`（或 `./securevault <命令>`）。
 
-SecureVault 命令行默认采用**安全交互式密码输入**（输入时不显示字符，支持中文密码），**彻底避免密码残留在终端命令历史（CMD/PowerShell）、系统任务管理器进程列表或 Windows 安全审计事件日志（Event 4688 / Sysmon）中**。
+SecureVault 命令行默认采用**安全交互式密码输入**（输入时不显示字符，全面支持中文字符与高熵随机密码），**彻底避免密码残留在终端命令历史（Bash/Zsh/PowerShell）、系统任务管理器进程列表或操作系统审计日志中**。
 
 ### 1. 常用命令清单
 
-| 命令格式 | 功能说明 | 密码输入机制 |
+| 命令格式 | 功能说明 | 密码机制 / 参数说明 |
 | :--- | :--- | :--- |
-| `securevault gui` | 启动原生图形界面（无参数运行 `securevault` 默认亦启动 GUI） | 界面图形化输入 |
-| `securevault lock <文件夹路径>` | 将指定文件夹原地加密锁定为保险箱 | 控制台安全交互输入并二次确认 |
-| `securevault unlock <文件夹路径>` | 将已锁定的文件夹原地解密还原 | 控制台安全交互输入 |
-| `securevault append <文件夹路径>` | 为已锁定文件夹继续加密新增文件/同步新目录 | 控制台安全交互输入原密码（不接收 `-p` 参数） |
-| `securevault status <文件夹路径>` | 查看文件夹当前是处于锁定（密文）还是解锁（明文）状态 | 无需密码 |
-| `securevault --help` | 查看帮助文档与子命令列表 | 无需密码 |
+| `securevault gui` | 启动原生图形界面（无参数运行且在图形桌面下时默认启动 GUI） | 界面图形化操作 |
+| `securevault lock <路径1> [路径2...]` | 将一个或多个文件夹原地加密锁定为保险箱（支持批量） | 控制台安全交互输入并二次确认（支持 `--hint`，脚本可用 `-p`） |
+| `securevault unlock <路径1> [路径2...]` | 将一个或多个已锁定的保险箱原地解密还原（支持批量） | 控制台安全交互输入（脚本可用 `-p`） |
+| `securevault append <路径1> [路径2...]` | 为已锁定的保险箱继续加密新增文件/同步新目录（支持批量） | 控制台安全交互输入原密码（安全考虑不接收 `-p` 参数） |
+| `securevault status <路径1> [路径2...]` | 查看指定文件夹当前是处于锁定（密文）还是解锁（明文）状态 | 无需密码，支持批量检测 |
+| `securevault info <路径>`<br>*(别名: `inspect`)* | 深度探查保险箱元数据（体积、文件数、分块数、创建时间与密码提示等） | 无需密码 |
+| `securevault list`<br>*(别名: `vaults`)* | 列出当前系统记录的所有常驻保险箱及实时锁定状态 | 无需密码 |
+| `securevault add <路径> [-n, --name <别名>]` | 将指定文件夹添加至系统的常驻保险箱管理列表 | 无需密码 |
+| `securevault remove <路径或别名>` | 从常驻保险箱列表中移除指定文件夹（不删除本地文件） | 无需密码 |
+| `securevault --help` | 查看完整帮助文档与所有子命令详细参数 | 无需密码 |
 
 ---
 
-### 2. 命令详细说明与交互式流程
+### 2. 命令详细说明与交互式使用示例
 
-- **启动 GUI 界面**：
-  ```bash
-  securevault gui
-  # 或直接运行（无子命令默认启动 GUI）：
-  securevault
-  ```
+#### ① 单个与批量加密锁定 (`lock`)
+```bash
+# 单个文件夹加密：
+securevault lock /path/to/my_folder
 
-- **加密锁定（交互式设置并确认密码）**：
-  ```bash
-  securevault lock /path/to/folder
-  ```
-  执行后将弹出交互式密码提示（字符不回显），需输入并二次确认：
+# 批量加密多个文件夹（支持统一设置密码，逐个处理）：
+securevault lock /data/project1 /data/project2 /data/project3
+
+# 附带密码提示（Hint）加密：
+securevault lock /path/to/my_folder --hint "常用八位密码"
+```
+执行后将提示交互式设置密码并确认（字符不回显）：
+```text
+💡 提示: 密码支持中文、字母、数字及特殊符号。采用零知识高强加密，无密码找回机制，请务必牢记！
+Enter new password: [输入密码，无回显]
+Confirm password:   [再次确认密码]
+```
+
+#### ② 单个与批量解密还原 (`unlock`)
+```bash
+# 单个文件夹解密：
+securevault unlock /path/to/my_folder
+
+# 批量解密多个文件夹：
+securevault unlock /data/project1 /data/project2
+```
+若保险箱加密时留有密码提示（Hint），系统会在提示输入密码前友好显示该提示信息。
+
+#### ③ 继续加密新增文件 (`append`)
+```bash
+# 将新放入已锁定文件夹中的文件进行增量加密同步：
+securevault append /path/to/locked_folder
+
+# 批量增量同步多个保险箱：
+securevault append /data/project1 /data/project2
+```
+处理新增文件并同步新增空目录，已有密文数据块保持不变；相对路径冲突时停止，不覆盖。
+
+#### ④ 检查锁定状态 (`status`)
+```bash
+securevault status /path/folder1 /path/folder2
+```
+输出示例：
+```text
+🔒 Folder is LOCKED: /path/folder1
+🔓 Folder is UNLOCKED: /path/folder2
+```
+
+#### ⑤ 深度查看保险箱元数据 (`info` / `inspect`)
+```bash
+securevault info /path/to/my_folder
+```
+输出示例：
+```text
+📦 Vault Information: /path/to/my_folder
+  Status:           🔒 LOCKED (Encrypted)
+  Encrypted Size:   142.50 MB
+  Ciphertext Blocks: 18 files in .vault_data
+  Created Time:     2026-11-24 09:15:20
+  Password Hint:    常用工作密钥
+```
+
+#### ⑥ 管理常驻跟踪列表 (`list`, `add`, `remove`)
+```bash
+# 查看所有已记录的保险箱：
+securevault list
+
+# 添加新的保险箱并指定别名：
+securevault add /data/confidential --name "机密档案"
+
+# 从跟踪列表中移除（安全操作，不触碰任何本地文件）：
+securevault remove "机密档案"
+# 或按路径移除：
+securevault remove /data/confidential
+```
+
+#### ⑦ 更换密码流程（交互式）
+如需更换密码，遵循“先解密还原、再重新加密锁定”的安全交互式流程：
+```bash
+# 步骤 1：解密还原（交互式输入原密码）
+securevault unlock /path/to/folder
+
+# 步骤 2：重新加密（交互式设置并确认新密码）
+securevault lock /path/to/folder
+```
+
+---
+
+### 3. Linux 无显示环境（Headless / SSH / Server）支持
+
+在没有 X11 / Wayland 图形桌面服务（例如云服务器、远程 SSH 会话或 Docker 容器）中运行 `securevault` 时：
+- 程序会自动检测 `DISPLAY` 与 `WAYLAND_DISPLAY` 环境变量。
+- 若未提供子命令，系统不会尝试初始化图形栈而崩溃，而是友好输出提示并展示命令行帮助信息：
   ```text
-  Enter new password: [输入密码，无回显]
-  Confirm password:   [再次确认密码]
-  ```
-
-- **解密还原（交互式验证密码）**：
-  ```bash
-  securevault unlock /path/to/folder
-  ```
-  执行后将弹出交互式输入提示：
-  ```text
-  Enter password: [输入密码，无回显]
-  ```
-
-- **继续加密新增文件（交互式输入原密码）**：
-  ```bash
-  securevault append /path/to/locked-folder
-  ```
-  执行后将提示输入该保险箱的原密码：
-  ```text
-  Enter existing password: [输入原密码，无回显]
-  ```
-  处理新增文件并同步新增空目录，已有密文数据块保持不变；相对路径冲突时停止，不覆盖。请勿在操作期间改动该文件夹内的文件或目录。
-
-- **查看锁定状态**：
-  ```bash
-  securevault status /path/to/folder
-  ```
-  输出示例：
-  * `🔒 Folder is LOCKED: /path/to/folder`（已加密锁定）
-  * `🔓 Folder is UNLOCKED: /path/to/folder`（明文解锁状态）
-
-- **更换密码流程（交互式）**：
-  如需更换密码，遵循“先解密还原、再重新加密锁定”的安全交互式流程：
-  ```bash
-  # 步骤 1：解密还原（交互式输入原密码）
-  securevault unlock /path/to/folder
-
-  # 步骤 2：重新加密（交互式设置并确认新密码）
-  securevault lock /path/to/folder
+  ℹ️  Notice: No graphical display detected (DISPLAY or WAYLAND_DISPLAY not set).
+  Running in CLI mode. Use 'securevault --help' to see all available subcommands.
   ```
 
 ---
 
-### 3. 自动化脚本参数说明（谨慎使用）
+### 4. 自动化脚本参数说明（谨慎使用）
 
 针对无人值守 CI/CD 或自动化测试场景，`lock` 与 `unlock` 命令支持通过 `-p, --password` 传入密码：
 ```bash
@@ -251,4 +342,4 @@ securevault unlock /path/to/folder -p "测试临时密码123"
 ```
 
 > [!WARNING]
-> **安全警示**：日常使用**强烈推荐使用默认的交互式输入**。切勿在日常交互中使用 `-p / --password` 传递重要密码，否则密码将直接以明文形式暴露在系统命令行历史记录、任务管理器详情列以及 Windows 事件审核日志中。`append`（继续加密）命令出于安全审计考虑已硬性禁止 `-p` 参数。
+> **安全警示**：日常使用**强烈推荐使用默认的交互式输入**。切勿在日常交互中使用 `-p / --password` 传递重要密码，否则密码将直接以明文形式暴露在系统命令行历史记录、任务管理器详情列以及安全审计日志中。`append`（继续加密）命令出于安全审计考虑已硬性禁止 `-p` 参数。

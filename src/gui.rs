@@ -211,11 +211,33 @@ pub fn setup_chinese_fonts(ctx: &egui::Context) {
         "/System/Library/Fonts/STHeiti Light.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
         "/System/Library/Fonts/Supplemental/Songti.ttc",
+        // Ubuntu & Linux Desktop (Noto Sans CJK, WenQuanYi, Droid, etc.)
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/cjkuni-uming/uming.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
     ];
 
-    for path in candidate_paths {
-        if Path::new(path).exists() {
-            if let Ok(bytes) = std::fs::read(path) {
+    let mut all_paths: Vec<PathBuf> = candidate_paths.iter().map(PathBuf::from).collect();
+    if let Ok(home) = std::env::var("HOME") {
+        let home_p = Path::new(&home);
+        for sub in &[
+            ".local/share/fonts/NotoSansCJK-Regular.ttc",
+            ".local/share/fonts/wqy-microhei.ttc",
+            ".fonts/NotoSansCJK-Regular.ttc",
+            ".fonts/wqy-microhei.ttc",
+        ] {
+            all_paths.push(home_p.join(sub));
+        }
+    }
+
+    for path in all_paths {
+        if path.exists() {
+            if let Ok(bytes) = std::fs::read(&path) {
                 fonts.font_data.insert(
                     "chinese_font".to_owned(),
                     std::sync::Arc::new(egui::FontData::from_owned(bytes)),
@@ -928,9 +950,14 @@ fn get_app_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn get_config_path() -> PathBuf {
+pub fn get_config_path() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         let dir = PathBuf::from(appdata).join("SecureVault");
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.join("tracked_vaults.json");
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        let dir = PathBuf::from(xdg).join("securevault");
         let _ = std::fs::create_dir_all(&dir);
         return dir.join("tracked_vaults.json");
     }
@@ -942,7 +969,7 @@ fn get_config_path() -> PathBuf {
     PathBuf::from(".securevault_tracked.json")
 }
 
-fn load_tracked_vaults() -> Vec<TrackedVault> {
+pub fn load_tracked_vaults() -> Vec<TrackedVault> {
     let path = get_config_path();
     if let Ok(content) = std::fs::read_to_string(&path) {
         if let Ok(list) = serde_json::from_str::<Vec<TrackedVault>>(&content) {
@@ -952,8 +979,12 @@ fn load_tracked_vaults() -> Vec<TrackedVault> {
 
     // Default: if aabb on Desktop exists, include it for convenience
     let mut default_list = Vec::new();
-    if let Ok(userprofile) = std::env::var("USERPROFILE") {
-        let test_folder = PathBuf::from(userprofile).join("Desktop").join("aabb");
+    let desktop_opt = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(|h| PathBuf::from(h).join("Desktop").join("aabb"));
+
+    if let Some(test_folder) = desktop_opt {
         if test_folder.exists() {
             default_list.push(TrackedVault {
                 name: "aabb".into(),
@@ -964,7 +995,7 @@ fn load_tracked_vaults() -> Vec<TrackedVault> {
     default_list
 }
 
-fn save_tracked_vaults(list: &[TrackedVault]) {
+pub fn save_tracked_vaults(list: &[TrackedVault]) {
     let path = get_config_path();
     if let Ok(json) = serde_json::to_string_pretty(list) {
         let _ = std::fs::write(path, json);
@@ -1149,7 +1180,7 @@ fn is_plain_tree_all_expanded(nodes: &[FileTreeNode], expanded: &HashSet<PathBuf
     true
 }
 
-fn inspect_vault(path: &Path) -> Arc<VaultInspection> {
+pub fn inspect_vault(path: &Path) -> Arc<VaultInspection> {
     if !path.exists() || !path.is_dir() {
         return Arc::new(VaultInspection {
             is_locked: false,
@@ -1508,7 +1539,7 @@ fn render_file_tree(
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{} B", bytes)
     } else if bytes < 1024 * 1024 {

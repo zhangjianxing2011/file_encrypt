@@ -800,7 +800,7 @@ fn set_hidden_attribute(path: &Path) -> Result<()> {
 }
 
 /// Canonicalize a path without the Windows `\\?\` prefix.
-fn dunce_canonicalize(path: &Path) -> Result<PathBuf> {
+pub fn dunce_canonicalize(path: &Path) -> Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
 
     // Strip the \\?\ prefix on Windows for cleaner display

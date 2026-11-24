@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SecureVault
+GenericName=File Encryption Vault
+Comment=High-security zero-knowledge file encryption tool with GUI and CLI support
+Comment[zh_CN]=高强度零知识文件保险箱与加密工具，支持图形化与命令行操作
+Exec=securevault %F
+Icon=securevault
+Terminal=false
+Categories=Utility;Security;Cryptography;
+Keywords=encryption;security;vault;privacy;aes;argon2;
+MimeType=application/x-securevault;
+StartupNotify=true
