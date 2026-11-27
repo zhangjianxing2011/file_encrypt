@@ -5627,7 +5627,7 @@ impl SecureVaultApp {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(VaultTaskMsg::Error(e.to_string()));
+                        let _ = tx.send(VaultTaskMsg::Error(format!("{:#}", e)));
                     }
                 }
             };
@@ -5700,7 +5700,7 @@ impl SecureVaultApp {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(VaultTaskMsg::Error(e.to_string()));
+                        let _ = tx.send(VaultTaskMsg::Error(format!("{:#}", e)));
                     }
                 }
             };

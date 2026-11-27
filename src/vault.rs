@@ -311,7 +311,7 @@ where
     let mut sorted_dirs = dirs.clone();
     sorted_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
     for dir in &sorted_dirs {
-        let _ = fs::remove_dir(dir);
+        remove_emptied_dir(dir);
     }
 
     // Hide vault files on Windows
@@ -431,7 +431,9 @@ where
     );
 
     // ── 4. Recreate directories ─────────────────────────────────
-    // Sort by depth (shallowest first) to create parents before children
+    // Sort by depth (shallowest first) to create parents before children.
+    // Apply restrictive Unix directory modes after file restoration so read-only
+    // directories never block writing restored files inside them.
     let mut sorted_dirs = index.dirs.clone();
     sorted_dirs.sort_by_key(|d| d.path.matches('/').count());
 
@@ -439,12 +441,6 @@ where
         let dir_path = folder.join(&dir.path);
         if !dir_path.exists() {
             fs::create_dir_all(&dir_path)?;
-        }
-
-        #[cfg(unix)]
-        if let Some(mode) = dir.unix_mode {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&dir_path, fs::Permissions::from_mode(mode));
         }
     }
 
@@ -472,13 +468,8 @@ where
                 }
 
                 // Authenticated decryption with expected size & SHA-256
-                match crypto.decrypt_file_authenticated(
-                    &enc_path,
-                    &dst_path,
-                    Some(entry.size),
-                    entry.sha256.as_deref(),
-                ) {
-                    Ok(_) => {
+                match restore_single_entry(&crypto, &enc_path, &dst_path, entry) {
+                    Ok(()) => {
                         restore_file_metadata(&dst_path, entry);
                         let completed = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         pb.inc(1);
@@ -486,8 +477,10 @@ where
                         Ok((dst_path, entry.id.clone()))
                     }
                     Err(e) => {
-                        // Clean up any partially written destination file
-                        let _ = fs::remove_file(&dst_path);
+                        // Clean up any partially written destination file unless a pre-existing file blocked creation
+                        if !err_is_already_exists(&e) {
+                            let _ = fs::remove_file(&dst_path);
+                        }
                         let completed = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         pb.inc(1);
                         progress(completed, total_files, &entry.path, 0);
@@ -498,6 +491,19 @@ where
             .collect()
     });
     pb.finish_with_message("done");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in sorted_dirs.iter().rev() {
+            if let Some(mode) = dir.unix_mode {
+                let dir_path = folder.join(&dir.path);
+                if dir_path.is_dir() {
+                    let _ = fs::set_permissions(&dir_path, fs::Permissions::from_mode(mode));
+                }
+            }
+        }
+    }
 
     let mut restored_paths: Vec<String> = Vec::new();
     let mut restored_enc_ids: Vec<String> = Vec::new();
@@ -614,11 +620,129 @@ pub fn is_locked(folder: &Path) -> bool {
             && folder.join(VAULT_DATA_DIR).join(VAULT_META_BACKUP_FILE).exists())
 }
 
+pub(crate) fn is_link(md: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        md.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        md.file_type().is_symlink()
+    }
+}
+
+/// Returns true for disposable OS-generated metadata/cache files created silently
+/// by Finder/Explorer (e.g. `.DS_Store`, `Thumbs.db`), which should not be encrypted
+/// or allowed to block unlock/append when regenerated on disk.
+pub(crate) fn is_os_metadata_file_name(name: &str) -> bool {
+    [".ds_store", "._.ds_store", "thumbs.db", "desktop.ini"]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+pub(crate) fn is_os_metadata_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_os_metadata_file_name)
+}
+
+fn is_regular_file_on_disk(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|md| md.is_file() && !is_link(&md))
+}
+
+fn remove_regular_os_metadata_file(path: &Path) {
+    if is_os_metadata_path(path) && is_regular_file_on_disk(path) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Remove `dir` if it is empty or contains only regular disposable OS metadata files.
+pub(crate) fn remove_emptied_dir(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut metadata_files = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return;
+        };
+        let path = entry.path();
+        let Ok(md) = fs::symlink_metadata(&path) else {
+            return;
+        };
+        if md.is_file()
+            && !is_link(&md)
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_os_metadata_file_name)
+        {
+            metadata_files.push(path);
+        } else {
+            return;
+        }
+    }
+    for file in metadata_files {
+        let _ = fs::remove_file(file);
+    }
+    let _ = fs::remove_dir(dir);
+}
+
+fn err_is_already_exists(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::AlreadyExists)
+    })
+}
+
+fn restore_single_entry(
+    crypto: &CryptoEngine,
+    enc_path: &Path,
+    dst_path: &Path,
+    entry: &FileEntry,
+) -> Result<()> {
+    let is_os_meta = is_os_metadata_path(dst_path);
+    if is_os_meta {
+        remove_regular_os_metadata_file(dst_path);
+    }
+
+    match crypto.decrypt_file_authenticated(
+        enc_path,
+        dst_path,
+        Some(entry.size),
+        entry.sha256.as_deref(),
+    ) {
+        Ok(_) => Ok(()),
+        Err(err) if is_os_meta && err_is_already_exists(&err) => {
+            remove_regular_os_metadata_file(dst_path);
+            match crypto.decrypt_file_authenticated(
+                enc_path,
+                dst_path,
+                Some(entry.size),
+                entry.sha256.as_deref(),
+            ) {
+                Ok(_) => Ok(()),
+                Err(retry_err)
+                    if err_is_already_exists(&retry_err) && is_regular_file_on_disk(dst_path) =>
+                {
+                    // Finder/Explorer recreated the disposable cache file mid-retry;
+                    // treat it as present so vault cleanup can finish cleanly.
+                    Ok(())
+                }
+                Err(retry_err) => Err(retry_err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
 
 // ─── File Scanning ──────────────────────────────────────────────────
 
 /// Walk the folder tree and collect all regular files and directories,
-/// skipping vault internal files.
+/// skipping vault internal files and disposable OS metadata files.
 fn scan_folder(folder: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -636,7 +760,9 @@ fn scan_folder(folder: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         let ft = entry.file_type();
 
         if ft.is_file() {
-            files.push(entry.into_path());
+            if !is_os_metadata_path(entry.path()) {
+                files.push(entry.into_path());
+            }
         } else if ft.is_dir() {
             dirs.push(entry.into_path());
         }
@@ -1332,5 +1458,158 @@ mod tests {
         assert_eq!(legacy_meta.password_hint, None);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lock_and_unlock_ignore_disposable_os_metadata_files() {
+        let dir = setup_test_folder("ignore_os_meta");
+        create_test_file(&dir, ".DS_Store", b"finder cache root");
+        create_test_file(&dir, "sub/.DS_Store", b"finder cache sub");
+        create_test_file(&dir, "sub/Thumbs.db", b"thumbs cache");
+        create_test_file(&dir, "sub/desktop.ini", b"desktop ini");
+        create_test_file(&dir, "sub/photo.jpg", b"real photo bytes");
+        create_test_file(&dir, ".env", b"REAL_USER_DOTFILE=1");
+
+        let pwd = "os-meta-test-password";
+        let report = lock(&dir, pwd).unwrap();
+        assert!(report.is_complete());
+        // Only photo.jpg and .env are encrypted (not .DS_Store / Thumbs.db / desktop.ini)
+        assert_eq!(report.encrypted_files, 2);
+        // Emptied subdir containing only OS metadata must be cleaned up cleanly
+        assert!(!dir.join("sub").exists());
+
+        // Simulate Finder regenerating .DS_Store inside locked folder before unlock
+        create_test_file(&dir, ".DS_Store", b"regenerated root cache");
+        let un_report = unlock(&dir, pwd).unwrap();
+        assert!(un_report.is_complete());
+        assert!(un_report.vault_cleaned);
+        assert_eq!(un_report.restored.len(), 2);
+        assert_eq!(fs::read(dir.join("sub/photo.jpg")).unwrap(), b"real photo bytes");
+        assert_eq!(fs::read(dir.join(".env")).unwrap(), b"REAL_USER_DOTFILE=1");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unlock_legacy_vault_tolerates_regenerated_os_metadata_files() {
+        let dir = setup_test_folder("legacy_os_meta_unlock");
+        create_test_file(&dir, "PICTURE/photo.jpg", b"important picture");
+
+        let pwd = "legacy-vault-password";
+        let salt = CryptoEngine::generate_salt();
+        let crypto = CryptoEngine::new(pwd.as_bytes(), &salt, DEFAULT_CHUNK_SIZE).unwrap();
+        let vault_data = dir.join(VAULT_DATA_DIR);
+        fs::create_dir_all(&vault_data).unwrap();
+
+        // Build a legacy-style VaultIndex that includes .DS_Store and Thumbs.db
+        let mut entries = Vec::new();
+        for (rel, content) in [
+            (".DS_Store", b"old root ds_store".as_slice()),
+            ("PICTURE/.DS_Store", b"old pic ds_store".as_slice()),
+            ("PICTURE/Thumbs.db", b"old thumbs".as_slice()),
+            ("PICTURE/photo.jpg", b"important picture".as_slice()),
+        ] {
+            let src = dir.join(rel);
+            if !src.exists() {
+                create_test_file(&dir, rel, content);
+            }
+            let id = Uuid::new_v4().to_string();
+            let enc = vault_data.join(format!("{id}.enc"));
+            let digest = crypto.encrypt_file(&src, &enc).unwrap();
+            entries.push(build_file_entry(&id, &src, &dir, Some(digest)).unwrap());
+            fs::remove_file(&src).unwrap();
+        }
+        let dirs = build_dir_entries(&dir, &[dir.join("PICTURE")]).unwrap();
+        fs::remove_dir_all(dir.join("PICTURE")).unwrap();
+
+        let index = VaultIndex {
+            version: 1,
+            files: entries,
+            dirs,
+        };
+        let enc_idx = crypto.encrypt_index(&serde_json::to_vec(&index).unwrap()).unwrap();
+        let meta = VaultMeta {
+            version: 1,
+            salt: BASE64.encode(salt),
+            password_check: BASE64.encode(crypto.password_check()),
+            chunk_size: DEFAULT_CHUNK_SIZE as u32,
+            encrypted_index: BASE64.encode(enc_idx),
+            password_hint: Some("yoho".to_string()),
+        };
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(dir.join(VAULT_META_FILE), &meta_json).unwrap();
+        fs::write(vault_data.join(VAULT_META_BACKUP_FILE), &meta_json).unwrap();
+
+        // Simulate Finder creating conflicting .DS_Store files and adding a new plaintext file
+        create_test_file(&dir, ".DS_Store", b"new finder root ds_store");
+        create_test_file(&dir, "PICTURE/.DS_Store", b"new finder pic ds_store");
+        create_test_file(&dir, "PICTURE/Thumbs.db", b"new windows thumbs");
+        create_test_file(&dir, "PICTURE/new_added.jpg", b"brand new photo");
+
+        let report = unlock(&dir, pwd).unwrap();
+        assert!(report.is_complete(), "failed: {:?}", report.failed);
+        assert!(report.vault_cleaned);
+        assert_eq!(report.restored.len(), 4);
+        assert_eq!(
+            fs::read(dir.join("PICTURE/photo.jpg")).unwrap(),
+            b"important picture"
+        );
+        assert_eq!(
+            fs::read(dir.join("PICTURE/new_added.jpg")).unwrap(),
+            b"brand new photo"
+        );
+        assert!(!is_locked(&dir));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unlock_still_rejects_symlink_os_metadata_conflict() {
+        let dir = setup_test_folder("symlink_os_meta_reject");
+        create_test_file(&dir, "secret.txt", b"secret");
+        let outside = setup_test_folder("symlink_os_meta_outside");
+        let target = outside.join("victim.txt");
+        fs::write(&target, b"do not touch").unwrap();
+
+        let pwd = "symlink-test-password";
+        let salt = CryptoEngine::generate_salt();
+        let crypto = CryptoEngine::new(pwd.as_bytes(), &salt, DEFAULT_CHUNK_SIZE).unwrap();
+        let vault_data = dir.join(VAULT_DATA_DIR);
+        fs::create_dir_all(&vault_data).unwrap();
+
+        create_test_file(&dir, ".DS_Store", b"ds");
+        let id = Uuid::new_v4().to_string();
+        let digest = crypto
+            .encrypt_file(&dir.join(".DS_Store"), &vault_data.join(format!("{id}.enc")))
+            .unwrap();
+        let entry = build_file_entry(&id, &dir.join(".DS_Store"), &dir, Some(digest)).unwrap();
+        fs::remove_file(dir.join(".DS_Store")).unwrap();
+        fs::remove_file(dir.join("secret.txt")).unwrap();
+
+        let index = VaultIndex {
+            version: 1,
+            files: vec![entry],
+            dirs: vec![],
+        };
+        let enc_idx = crypto.encrypt_index(&serde_json::to_vec(&index).unwrap()).unwrap();
+        let meta = VaultMeta {
+            version: 1,
+            salt: BASE64.encode(salt),
+            password_check: BASE64.encode(crypto.password_check()),
+            chunk_size: DEFAULT_CHUNK_SIZE as u32,
+            encrypted_index: BASE64.encode(enc_idx),
+            password_hint: None,
+        };
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(dir.join(VAULT_META_FILE), &meta_json).unwrap();
+
+        std::os::unix::fs::symlink(&target, dir.join(".DS_Store")).unwrap();
+        let err = unlock(&dir, pwd).unwrap_err().to_string();
+        assert!(err.contains("冲突"), "{err}");
+        assert_eq!(fs::read(&target).unwrap(), b"do not touch");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 }

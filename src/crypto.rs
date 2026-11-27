@@ -2,7 +2,7 @@ use aes_gcm::{
     aead::{Aead, AeadInPlace, KeyInit},
     Aes256Gcm, Key, Nonce, Tag,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use hmac::Hmac;
@@ -247,7 +247,7 @@ impl CryptoEngine {
         let chunk_size = u32::from_le_bytes(header) as usize;
 
         let dst_file = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)
-            .map_err(|e| anyhow!("Cannot create output file '{}': {}", dst.display(), e))?;
+            .with_context(|| format!("Cannot create output file '{}'", dst.display()))?;
         let mut writer = BufWriter::with_capacity(chunk_size, dst_file);
 
         // Pre-allocate reusable buffers for in-place decryption

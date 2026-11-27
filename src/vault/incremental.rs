@@ -28,18 +28,6 @@ pub(super) fn operation_lock(folder: &Path) -> Result<fs::File> {
     Ok(file)
 }
 
-fn is_link(md: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        md.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        md.file_type().is_symlink()
-    }
-}
-
 fn regular(path: &Path, directory: bool) -> Result<()> {
     let md = fs::symlink_metadata(path)?;
     ensure!(
@@ -137,11 +125,18 @@ pub(super) fn check_restore_targets(folder: &Path, index: &VaultIndex) -> Result
             target.push(part.as_os_str());
             let needs_directory = directory || i + 1 < parts.len();
             match fs::symlink_metadata(&target) {
-                Ok(md) => ensure!(
-                    needs_directory && md.is_dir() && !is_link(&md),
-                    "解密路径冲突，请先将现存明文或冲突项移到安全位置: {}",
-                    target.display()
-                ),
+                Ok(md) => {
+                    let allowed_dir = needs_directory && md.is_dir() && !is_link(&md);
+                    let allowed_os_metadata = !needs_directory
+                        && md.is_file()
+                        && !is_link(&md)
+                        && is_os_metadata_path(&target);
+                    ensure!(
+                        allowed_dir || allowed_os_metadata,
+                        "解密路径冲突，请先将现存明文或冲突项移到安全位置: {}",
+                        target.display()
+                    );
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
@@ -289,6 +284,9 @@ fn append_with_hook(
             "不支持链接或特殊文件，请先移出: {}",
             path.display()
         );
+        if md.is_file() && is_os_metadata_path(path) {
+            continue;
+        }
         let relative = path
             .strip_prefix(&folder)?
             .components()
@@ -407,7 +405,7 @@ fn append_with_hook(
     }
     dirs.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
     for (dir, _) in &dirs {
-        let _ = fs::remove_dir(dir);
+        remove_emptied_dir(dir);
     }
     ensure!(
         failures.is_empty(),
@@ -658,5 +656,87 @@ mod tests {
             fs::remove_file(f.0.join(name)).unwrap();
         }
         check_restore_targets(&f.0, &index).unwrap();
+    }
+
+    #[test]
+    fn append_skips_os_metadata_even_when_legacy_index_contains_them() {
+        let f = Fixture::new();
+        f.write("sub/old.txt", b"old secret");
+
+        // Manually build a legacy vault that already recorded .DS_Store in its index
+        let salt = CryptoEngine::generate_salt();
+        let crypto = CryptoEngine::new(PASSWORD.as_bytes(), &salt, DEFAULT_CHUNK_SIZE).unwrap();
+        let data = f.0.join(VAULT_DATA_DIR);
+        fs::create_dir_all(&data).unwrap();
+
+        let mut files = Vec::new();
+        for (rel, bytes) in [
+            (".DS_Store", b"legacy root ds".as_slice()),
+            ("sub/.DS_Store", b"legacy sub ds".as_slice()),
+            ("sub/old.txt", b"old secret".as_slice()),
+        ] {
+            f.write(rel, bytes);
+            let p = f.0.join(rel);
+            let id = Uuid::new_v4().to_string();
+            let digest = crypto
+                .encrypt_file(&p, &data.join(format!("{id}.enc")))
+                .unwrap();
+            files.push(build_file_entry(&id, &p, &f.0, Some(digest)).unwrap());
+            fs::remove_file(&p).unwrap();
+        }
+        let dirs = build_dir_entries(&f.0, &[f.0.join("sub")]).unwrap();
+        fs::remove_dir_all(f.0.join("sub")).unwrap();
+
+        let index = VaultIndex {
+            version: 1,
+            files,
+            dirs,
+        };
+        let enc_idx = crypto.encrypt_index(&serde_json::to_vec(&index).unwrap()).unwrap();
+        let meta = VaultMeta {
+            version: 1,
+            salt: BASE64.encode(salt),
+            password_check: BASE64.encode(crypto.password_check()),
+            chunk_size: DEFAULT_CHUNK_SIZE as u32,
+            encrypted_index: BASE64.encode(enc_idx),
+            password_hint: None,
+        };
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(f.0.join(VAULT_META_FILE), &meta_json).unwrap();
+        fs::write(data.join(VAULT_META_BACKUP_FILE), &meta_json).unwrap();
+
+        // Finder adds regenerated .DS_Store files alongside a new real file in sub/
+        f.write(".DS_Store", b"new finder root ds");
+        f.write("sub/.DS_Store", b"new finder sub ds");
+        f.write("sub/new_photo.jpg", b"new photo bytes");
+
+        assert_eq!(append(&f.0, PASSWORD).unwrap(), 1);
+        assert!(!f.0.join("sub").exists());
+
+        // Unlock should also succeed cleanly even if root .DS_Store was regenerated again
+        f.write(".DS_Store", b"another finder root ds");
+        let report = super::super::unlock(&f.0, PASSWORD).unwrap();
+        assert!(report.is_complete(), "failed: {:?}", report.failed);
+        assert_eq!(fs::read(f.0.join("sub/old.txt")).unwrap(), b"old secret");
+        assert_eq!(
+            fs::read(f.0.join("sub/new_photo.jpg")).unwrap(),
+            b"new photo bytes"
+        );
+    }
+
+    #[test]
+    fn append_with_only_os_metadata_changes_is_noop() {
+        let f = Fixture::locked();
+        let before_blobs = f.blobs();
+        let before_meta = fs::read(f.0.join(VAULT_META_FILE)).unwrap();
+
+        f.write(".DS_Store", b"finder cache");
+        f.write("Thumbs.db", b"explorer cache");
+
+        let report = append(&f.0, PASSWORD).unwrap();
+        assert_eq!(report.added, 0);
+        assert!(report.is_complete());
+        assert_eq!(f.blobs(), before_blobs);
+        assert_eq!(fs::read(f.0.join(VAULT_META_FILE)).unwrap(), before_meta);
     }
 }
